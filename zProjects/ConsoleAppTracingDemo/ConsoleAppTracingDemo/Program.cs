@@ -22,50 +22,104 @@ namespace ConsoleAppTracingDemo
                 }
             };
 
-            ActivitySource.AddActivityListener(listener);
+            //ActivitySource.AddActivityListener(listener);
 
             using (var parentActivity = ActivitySource.StartActivity("ParentActivity")!)   // start a parent activity
             {
                 parentActivity.SetTag("rootTag", "This is the root activity.");    // set some additional information on the root activity
 
-                Console.WriteLine($"Root Activity Started: {parentActivity.Id}");
+                Console.WriteLine($"  RA Id: {parentActivity.Id}");
+                Console.WriteLine($"  RA RootId: {parentActivity.RootId}");
+                Console.WriteLine($"  RA TraceId: {parentActivity.TraceId}");
+                Console.WriteLine($"  RA ParentId: {parentActivity.ParentId}");
+                Console.WriteLine($"  RA ParentSpanId: {parentActivity.ParentSpanId}");
+                Console.WriteLine($"  RA SpanId: {parentActivity.SpanId}");
+                Console.WriteLine("\n");
 
+                //DoSomeWorkWithActivity();   // simulate some work with a child activity (Span)
 
-                DoSomeWorkWithActivity();   // simulate some work with a child activity (Span)
-
-                using (var childActivity = ActivitySource.StartActivity("ChildActivity2"))  // Additional child activity within the root activity
+                using (var childActivity = ActivitySource.StartActivity("ChildActivity"))  // Additional child activity within the root activity
 
                 {
                     if (childActivity != null)
                     {
                         childActivity.SetTag("childTag", "This is another child activity.");
-                        Console.WriteLine($"Child Activity 2 Started: {childActivity.Id}");
+
+                        Console.WriteLine($"  CA Id: {parentActivity.Id}");
+                        Console.WriteLine($"  CA RootId: {parentActivity.RootId}");
+                        Console.WriteLine($"  CA TraceId: {parentActivity.TraceId}");
+                        Console.WriteLine($"  CA ParentId: {parentActivity.ParentId}");
+                        Console.WriteLine($"  CA ParentSpanId: {parentActivity.ParentSpanId}");
+                        Console.WriteLine($"  CA SpanId: {parentActivity.SpanId}");
+                        Console.WriteLine("\n");
 
                         Thread.Sleep(200);  // simulate work
                     }
                 }
             }
 
+            Console.WriteLine("\n");
+
             Console.WriteLine("Tracing has finished.");
 
             Console.ReadLine();
         }
 
-        static void DoSomeWorkWithActivity()
-        {           
-            ActivitySource activitySource = new ActivitySource("MyActivitySource");    // create a new child activity (span)
 
-            using (var childActivity = activitySource.StartActivity("ChildActivity1"))
-            {
-                if (childActivity != null)
-                {                
-                    childActivity.SetTag("operation", "Some work is being done.");    // set some tags for the child activity
-                    Console.WriteLine($"Child Activity 1 Started: {childActivity.Id}");
-                 
-                    Thread.Sleep(300);   // simulate some work in the child activity
-                }
-            }
-        }
+        /*
+         
+        Activity Started: ParentActivity
+          RA Id: 00-97ab06572c06915ee197b02d31ed1d41-e70191024a00e576-01
+          RA RootId: 97ab06572c06915ee197b02d31ed1d41
+          RA TraceId: 97ab06572c06915ee197b02d31ed1d41
+          RA ParentId:
+          RA ParentSpanId: 0000000000000000
+          RA SpanId: e70191024a00e576
+
+
+        Activity Started: ChildActivity
+          CA Id: 00-97ab06572c06915ee197b02d31ed1d41-e70191024a00e576-01
+          CA RootId: 97ab06572c06915ee197b02d31ed1d41
+          CA TraceId: 97ab06572c06915ee197b02d31ed1d41
+          CA ParentId:
+          CA ParentSpanId: 0000000000000000
+          CA SpanId: e70191024a00e576
+         
+        */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        //static void DoSomeWorkWithActivity()
+        //{           
+        //    ActivitySource activitySource = new ActivitySource("MyActivitySource");    // create a new child activity (span)
+
+        //    using (var childActivity = activitySource.StartActivity("ChildActivity1"))
+        //    {
+        //        if (childActivity != null)
+        //        {                
+        //            childActivity.SetTag("operation", "Some work is being done.");    // set some tags for the child activity
+        //            Console.WriteLine($"Child Activity 1 Started: {childActivity.Id}");
+
+        //            Thread.Sleep(300);   // simulate some work in the child activity
+        //        }
+        //    }
+        //}
     }
 
 }
