@@ -1,0 +1,60 @@
+version: "3.9"
+services:
+  frontend:
+    build:
+      context: ./
+      dockerfile: ./frontend/Dockerfile
+    ports:
+      - "5051:5051"
+    depends_on:
+      - storage
+      - jaeger
+      - prometheus
+    environment:
+      - Storage__Endpoint=http://storage:5050
+      - ASPNETCORE_URLS=http://+:5051
+      - OTEL_SERVICE_NAME=frontend
+      - OTEL_EXPORTER_JAEGER_AGENT_HOST=jaeger
+  storage:
+    build:
+      context: ./
+      dockerfile: ./storage/Dockerfile
+    depends_on:
+      - jaeger
+      - prometheus
+    ports:
+      - "5050:5050"
+    environment:
+      - ASPNETCORE_URLS=http://+:5050
+      - OTEL_SERVICE_NAME=storage
+      - OTEL_EXPORTER_JAEGER_AGENT_HOST=jaeger      
+      # for demo purposes only, make sure to pass environment securely
+      - ConnectionStrings__MySql=server=mysql;user=root;password=pwd;database=memes
+  mysql:
+    image: docker.io/bitnami/mysql:8.0.33
+    ports:
+      - '3306:3306'
+    volumes:
+      - 'mysql_data:/bitnami/mysql/data'
+    environment:
+      # for demo purposes only, make sure to pass environment securely
+      - MYSQL_ROOT_PASSWORD=pwd
+  jaeger:
+    image: jaegertracing/all-in-one:1.45.0
+    ports:
+      - "14250:14250"
+      - "14268:14268"
+      - "6831:6831/udp"
+      - "16686:16686"
+      - "16685:16685"
+  prometheus:
+    image: prom/prometheus:v2.44.0
+    volumes:
+      - ./configs/prometheus-otel.yml:/etc/prometheus/prometheus.yml
+      - ./tmp/prometheus:/prometheus
+    ports:
+      - "9090:9090"
+      
+volumes:
+  mysql_data:
+    driver: local

@@ -1,0 +1,9 @@
+scrape_configs:
+  - job_name: 'frontend'
+    scrape_interval: 10s
+    static_configs:
+      - targets: ['frontend:5051']
+  - job_name: 'storage'
+    scrape_interval: 10s
+    static_configs:
+      - targets: ['storage:5050']

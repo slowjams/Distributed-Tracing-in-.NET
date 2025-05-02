@@ -131,7 +131,7 @@ see pact and cact how parentActivity's context passed to childActivity.
 
 `b3: {trace-id}-{span-id}-{sampling-state}-{parent-span-id}` 
 {parent-span-id} is optional for root span OpenTelemetry and .NET ignore {parent-span-id}
-Service A -> b3: abc123-11111111-1 -> Service B -> abc123-22222222-1-11111111 - -> Service C -> abc123-33333333-1-22222222 -> Downstream Services
+Service A ──►  b3: abc123-11111111-1 ──► Service B ──► abc123-22222222-1-11111111 ──► Service C ──► abc123-33333333-1-22222222 ──► Downstream Services
 
 
 ==================================================================================================================================================================
