@@ -53,13 +53,85 @@ A `trace` is a set of related spans fully describing a logical end-to-end operat
 **In .NET world, a `span` is represented by an `Activity`, System.Span class is not related to distributed tracing.**
 
 
+```C#
+class Program
+{
+    private static readonly ActivitySource ActivitySource = new ActivitySource("DemoApp.Tracing");
+    static void Main(string[] args)
+    {
+        using var listener = new ActivityListener
+        {
+            ShouldListenTo = source => source.Name == "DemoApp.Tracing", // Listen only to our ActivitySource
+            Sample = (ref ActivityCreationOptions<ActivityContext> options) => ActivitySamplingResult.AllDataAndRecorded,
+            ActivityStarted = activity => Console.WriteLine($"Activity Started: {activity.DisplayName}"),
+            ActivityStopped = activity =>
+            {
+                Console.WriteLine($"Activity Stopped: {activity.DisplayName}");
+                foreach (var tag in activity.Tags)
+                {
+                    Console.WriteLine($"Tag: {tag.Key} = {tag.Value}");
+                }
+            }
+        };
+
+        ActivitySource.AddActivityListener(listener);
+
+        using (Activity parentActivity = ActivitySource.StartActivity("ParentActivity"))   // start a parent activity
+        {
+            parentActivity.SetTag("rootTag", "This is the root activity.");    // set some additional information on the root activity
+
+            Console.WriteLine($"RA Id: {parentActivity.Id}"); Console.WriteLine($"RA RootId: {parentActivity.RootId}");
+            Console.WriteLine($"RA TraceId: {parentActivity.TraceId}"); Console.WriteLine($"RA ParentId: {parentActivity.ParentId}");
+            Console.WriteLine($"RA ParentSpanId: {parentActivity.ParentSpanId}"); Console.WriteLine($"RA SpanId: {parentActivity.SpanId}");
+
+            //Activity.Current = parentActivity; // <---------no need to explictly set it, the ActivitySource automatically sets the Activity.Current to the newly created activity
+
+            using (Activity childActivity = ActivitySource.StartActivity("ChildActivity"))  // Additional child activity within the root activity
+            {
+                childActivity.SetTag("childTag", "This is another child activity.");
+
+                Console.WriteLine($"CA Id: {childActivity.Id}"); Console.WriteLine($"CA RootId: {childActivity.RootId}");
+                Console.WriteLine($"CA TraceId: {childActivity.TraceId}"); Console.WriteLine($"CA ParentId: {childActivity.ParentId}");
+                Console.WriteLine($"CA ParentSpanId: {childActivity.ParentSpanId}"); Console.WriteLine($"CA SpanId: {childActivity.SpanId}");
+            }
+        }
+    }
+    /*
+        
+    Activity Started: ParentActivity
+        RA Id: 00-b62b47e1c2515b0eae286671696abc91-f5daa41dee1c2b7b-01
+        RA RootId: b62b47e1c2515b0eae286671696abc91
+        RA TraceId: b62b47e1c2515b0eae286671696abc91
+        RA ParentId:
+        RA ParentSpanId: 0000000000000000
+        RA SpanId: f5daa41dee1c2b7b
+
+    Activity Started: ChildActivity
+        CA Id: 00-b62b47e1c2515b0eae286671696abc91-b5dc34121e2bc5e1-01
+        CA RootId: b62b47e1c2515b0eae286671696abc91
+        CA TraceId: b62b47e1c2515b0eae286671696abc91
+        CA ParentId: 00-b62b47e1c2515b0eae286671696abc91-f5daa41dee1c2b7b-01
+        CA ParentSpanId: f5daa41dee1c2b7b
+        CA SpanId: b5dc34121e2bc5e1
+
+    Activity Stopped: ChildActivity
+        Tag: childTag = This is another child activity.
+    Activity Stopped: ParentActivity
+        Tag: rootTag = This is the root activity.
+      
+    */
+}
+```
+see pact and cact how parentActivity's context passed to childActivity.
 
 
+## W3C Trace Context
 
+`traceparent: {version}-{trace-id}-{parent-span-id}-{sampling-state}`
 
-
-
-
+`b3: {trace-id}-{span-id}-{sampling-state}-{parent-span-id}` 
+{parent-span-id} is optional for root span OpenTelemetry and .NET ignore {parent-span-id}
+Service A -> b3: abc123-11111111-1 -> Service B -> abc123-22222222-1-11111111 - -> Service C -> abc123-33333333-1-22222222 -> Downstream Services
 
 
 ==================================================================================================================================================================

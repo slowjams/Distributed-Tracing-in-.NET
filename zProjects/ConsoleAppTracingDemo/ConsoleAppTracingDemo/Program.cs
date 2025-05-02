@@ -22,9 +22,9 @@ namespace ConsoleAppTracingDemo
                 }
             };
 
-            //ActivitySource.AddActivityListener(listener);
+            ActivitySource.AddActivityListener(listener);
 
-            using (var parentActivity = ActivitySource.StartActivity("ParentActivity")!)   // start a parent activity
+            using (Activity parentActivity = ActivitySource.StartActivity("ParentActivity")!)   // start a parent activity
             {
                 parentActivity.SetTag("rootTag", "This is the root activity.");    // set some additional information on the root activity
 
@@ -36,25 +36,19 @@ namespace ConsoleAppTracingDemo
                 Console.WriteLine($"  RA SpanId: {parentActivity.SpanId}");
                 Console.WriteLine("\n");
 
-                //DoSomeWorkWithActivity();   // simulate some work with a child activity (Span)
+                //Activity.Current = parentActivity;  // <---------------------
 
-                using (var childActivity = ActivitySource.StartActivity("ChildActivity"))  // Additional child activity within the root activity
-
+                using (Activity childActivity = ActivitySource.StartActivity("ChildActivity")!)  // Additional child activity within the root activity
                 {
-                    if (childActivity != null)
-                    {
-                        childActivity.SetTag("childTag", "This is another child activity.");
+                    childActivity.SetTag("childTag", "This is another child activity.");
 
-                        Console.WriteLine($"  CA Id: {parentActivity.Id}");
-                        Console.WriteLine($"  CA RootId: {parentActivity.RootId}");
-                        Console.WriteLine($"  CA TraceId: {parentActivity.TraceId}");
-                        Console.WriteLine($"  CA ParentId: {parentActivity.ParentId}");
-                        Console.WriteLine($"  CA ParentSpanId: {parentActivity.ParentSpanId}");
-                        Console.WriteLine($"  CA SpanId: {parentActivity.SpanId}");
-                        Console.WriteLine("\n");
-
-                        Thread.Sleep(200);  // simulate work
-                    }
+                    Console.WriteLine($"  CA Id: {childActivity.Id}");
+                    Console.WriteLine($"  CA RootId: {childActivity.RootId}");
+                    Console.WriteLine($"  CA TraceId: {childActivity.TraceId}");
+                    Console.WriteLine($"  CA ParentId: {childActivity.ParentId}");
+                    Console.WriteLine($"  CA ParentSpanId: {childActivity.ParentSpanId}");
+                    Console.WriteLine($"  CA SpanId: {childActivity.SpanId}");
+                    Console.WriteLine("\n");
                 }
             }
 
@@ -69,57 +63,28 @@ namespace ConsoleAppTracingDemo
         /*
          
         Activity Started: ParentActivity
-          RA Id: 00-97ab06572c06915ee197b02d31ed1d41-e70191024a00e576-01
-          RA RootId: 97ab06572c06915ee197b02d31ed1d41
-          RA TraceId: 97ab06572c06915ee197b02d31ed1d41
+          RA Id: 00-b62b47e1c2515b0eae286671696abc91-f5daa41dee1c2b7b-01
+          RA RootId: b62b47e1c2515b0eae286671696abc91
+          RA TraceId: b62b47e1c2515b0eae286671696abc91
           RA ParentId:
           RA ParentSpanId: 0000000000000000
-          RA SpanId: e70191024a00e576
+          RA SpanId: f5daa41dee1c2b7b
 
 
         Activity Started: ChildActivity
-          CA Id: 00-97ab06572c06915ee197b02d31ed1d41-e70191024a00e576-01
-          CA RootId: 97ab06572c06915ee197b02d31ed1d41
-          CA TraceId: 97ab06572c06915ee197b02d31ed1d41
-          CA ParentId:
-          CA ParentSpanId: 0000000000000000
-          CA SpanId: e70191024a00e576
+          CA Id: 00-b62b47e1c2515b0eae286671696abc91-b5dc34121e2bc5e1-01
+          CA RootId: b62b47e1c2515b0eae286671696abc91
+          CA TraceId: b62b47e1c2515b0eae286671696abc91
+          CA ParentId: 00-b62b47e1c2515b0eae286671696abc91-f5daa41dee1c2b7b-01
+          CA ParentSpanId: f5daa41dee1c2b7b
+          CA SpanId: b5dc34121e2bc5e1
+
+
+        Activity Stopped: ChildActivity
+          Tag: childTag = This is another child activity.
+        Activity Stopped: ParentActivity
+          Tag: rootTag = This is the root activity.
          
         */
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-        //static void DoSomeWorkWithActivity()
-        //{           
-        //    ActivitySource activitySource = new ActivitySource("MyActivitySource");    // create a new child activity (span)
-
-        //    using (var childActivity = activitySource.StartActivity("ChildActivity1"))
-        //    {
-        //        if (childActivity != null)
-        //        {                
-        //            childActivity.SetTag("operation", "Some work is being done.");    // set some tags for the child activity
-        //            Console.WriteLine($"Child Activity 1 Started: {childActivity.Id}");
-
-        //            Thread.Sleep(300);   // simulate some work in the child activity
-        //        }
-        //    }
-        //}
     }
-
 }

@@ -59,7 +59,7 @@ public class Activity : IDisposable  // In .NET world, a span is represented by 
         EventHandler<ActivityChangedEventArgs>? handler = CurrentChanged;
         if (handler is null)
         {
-            s_current.Value = activity;
+            s_current.Value = activity;  // <-------------------------pact4.
         }
         else
         {
@@ -69,7 +69,7 @@ public class Activity : IDisposable  // In .NET world, a span is represented by 
         }
     }
 
-    public Activity Start()
+    public Activity Start()   // <-------------------------pact3.0, cact3.0
     {
         if (_id != null || _spanId != null)
         {
@@ -77,12 +77,13 @@ public class Activity : IDisposable  // In .NET world, a span is represented by 
         }
         else
         {
-            _previousActiveActivity = Current;
+            _previousActiveActivity = Current;   // <-------------------------pact3.1, Current is null for parentActivity
+                                                 // <-------------------------cact3.1, Current is not null for childActivity
             if (_parentId == null && _parentSpanId is null)
             {
                 if (_previousActiveActivity != null)
                 {
-                    Parent = _previousActiveActivity;
+                    Parent = _previousActiveActivity;   // <-------------------------cact3.2
                 }
             }
 
@@ -101,15 +102,111 @@ public class Activity : IDisposable  // In .NET world, a span is represented by 
             }
 
             if (IdFormat == ActivityIdFormat.W3C)
-                GenerateW3CId();
+                GenerateW3CId();   // <-------------------------pact3.2, cact3.3
             else
                 _id = GenerateHierarchicalId();
 
-            SetCurrent(this);
+            SetCurrent(this);     // <-------------------------pact3.3., cact3.4.
 
             Source.NotifyActivityStart(this);
         }
         return this;
+    }
+
+    internal static Activity Create(            // <-------------------------pact2.0
+                                    ActivitySource source, 
+                                    string name, 
+                                    ActivityKind kind, 
+                                    string? parentId, 
+                                    ActivityContext parentContext,
+                                    IEnumerable<KeyValuePair<string, object?>>? tags,
+                                    IEnumerable<ActivityLink>? links,
+                                    DateTimeOffset startTime,
+                                    ActivityTagsCollection? samplerTags, 
+                                    ActivitySamplingResult request, 
+                                    bool startIt,   // <----------------------------------
+                                    ActivityIdFormat idFormat,
+                                    string? traceState
+                                    )
+    {
+        Activity activity = new Activity(name);    // <-------------------------pact2.1
+ 
+        activity.Source = source;
+        activity.Kind = kind;
+        activity.IdFormat = idFormat;
+        activity._traceState = traceState;
+
+        if (links != null)
+        {
+            using (IEnumerator<ActivityLink> enumerator = links.GetEnumerator())
+            {
+                if (enumerator.MoveNext())
+                {
+                    activity._links = new DiagLinkedList<ActivityLink>(enumerator);
+                }
+            }
+        }
+
+        if (tags != null)
+        {
+            using (IEnumerator<KeyValuePair<string, object?>> enumerator = tags.GetEnumerator())
+            {
+                if (enumerator.MoveNext())
+                {
+                    activity._tags = new TagsLinkedList(enumerator);
+                }
+            }
+        }
+
+        if (samplerTags != null)
+        {
+            if (activity._tags == null)
+            {
+                activity._tags = new TagsLinkedList(samplerTags!);
+            }
+            else
+            {
+                activity._tags.Add(samplerTags!);
+            }
+        }
+
+        if (parentId != null)
+        {
+            activity._parentId = parentId;
+        }
+        else if (parentContext != default)
+        {
+            activity._traceId = parentContext.TraceId.ToString();
+
+            if (parentContext.SpanId != default)
+            {
+                activity._parentSpanId = parentContext.SpanId.ToString();
+            }
+
+            // note: don't inherit Recorded from parent as it is set below based on sampling decision
+            activity.ActivityTraceFlags = parentContext.TraceFlags & ~ActivityTraceFlags.Recorded;
+            activity._parentTraceFlags = (byte)parentContext.TraceFlags;
+            activity.HasRemoteParent = parentContext.IsRemote;
+        }
+
+        activity.IsAllDataRequested = request == ActivitySamplingResult.AllData || request == ActivitySamplingResult.AllDataAndRecorded;
+ 
+        if (request == ActivitySamplingResult.AllDataAndRecorded)
+        {
+            activity.ActivityTraceFlags |= ActivityTraceFlags.Recorded;
+        }
+
+        if (startTime != default)
+        {
+            activity.StartTimeUtc = startTime.UtcDateTime;
+        }
+
+        if (startIt)
+        {
+            activity.Start();  // <-------------------------pact2.2.
+        }
+
+        return activity;
     }
 
     public bool IsAllDataRequested { get; set; }
@@ -231,11 +328,28 @@ public sealed class ActivitySource : IDisposable
         return listeners != null && listeners.Count > 0;
     }
 
-    public Activity? CreateActivity(string name, ActivityKind kind)
-        => CreateActivity(name, kind, default, null, null, null, default, startIt: false);
+    public Activity? StartActivity(            // <-------------------------pact1.0, cact1.0
+                                string name,   
+                                ActivityKind kind,
+                                ActivityContext parentContext, 
+                                IEnumerable<KeyValuePair<string, object?>>? tags = null, 
+                                IEnumerable<ActivityLink>? links = null,
+                                DateTimeOffset startTime = default
+                                )
+        => CreateActivity(name, kind, parentContext, null, tags, links, startTime);   // <-------------------------pact1.0, cact1.0
+                                                                                     
     // ...
-    private Activity? CreateActivity(string name, ActivityKind kind, ActivityContext context, string? parentId, IEnumerable<KeyValuePair<string, object?>>? tags,
-                                        IEnumerable<ActivityLink>? links, DateTimeOffset startTime, bool startIt = true, ActivityIdFormat idFormat = ActivityIdFormat.Unknown)
+    private Activity? CreateActivity(   // <------------------------pact1.1, cact1.1
+                                     string name,   
+                                     ActivityKind kind,
+                                     ActivityContext context, 
+                                     string? parentId, 
+                                     IEnumerable<KeyValuePair<string, object?>>? tags,
+                                     IEnumerable<ActivityLink>? links, 
+                                     DateTimeOffset startTime, 
+                                     bool startIt = true,   // <-----------------
+                                     ActivityIdFormat idFormat = ActivityIdFormat.Unknown
+                                    )
     {
         // _listeners can get assigned to null in Dispose.
         SynchronizedList<ActivityListener>? listeners = _listeners;
@@ -250,7 +364,7 @@ public sealed class ActivitySource : IDisposable
 
         ActivitySamplingResult samplingResult = ActivitySamplingResult.None;
 
-        if (parentId != null)
+        if (parentId != null)   // parentId is null for both parentActivity and childActivity
         {
             ActivityCreationOptions<string> aco = default;
             ActivityCreationOptions<ActivityContext> acoContext = default;
@@ -328,7 +442,7 @@ public sealed class ActivitySource : IDisposable
             idFormat = aco.IdFormat;
             traceState = aco.TraceState;
         }
-        else
+        else    // <-------------------------pact1.2, cact1.2, for parentActivity and childActivity paths as parentId for parentActivity is null for both of them
         {
             bool useCurrentActivityContext = context == default && Activity.Current != null;
             var aco = new ActivityCreationOptions<ActivityContext>(this, name, useCurrentActivityContext ? Activity.Current!.Context : context, kind, tags, links, idFormat);
@@ -356,7 +470,8 @@ public sealed class ActivitySource : IDisposable
 
         if (samplingResult != ActivitySamplingResult.None)
         {
-            activity = Activity.Create(this, name, kind, parentId, context, tags, links, startTime, samplerTags, samplingResult, startIt, idFormat, traceState);
+            activity =  Activity.Create(this, name, kind, parentId, context, tags, links, startTime, samplerTags, samplingResult, startIt, idFormat, traceState);
+                        // <-------------------------pact1.2., cact1.2.                   startIt is true by default
         }
 
         return activity;
@@ -540,6 +655,14 @@ public enum ActivityIdFormat
     Hierarchical = 1, //|XXXX.XX.X_X ... see https://github.com/dotnet/runtime/blob/main/src/libraries/System.Diagnostics.DiagnosticSource/src/ActivityUserGuide.md#id-format
     W3C = 2,          // 00-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX-XXXXXXXXXXXXXXXX-XX see https://w3c.github.io/trace-context/
 };
+
+public enum ActivitySamplingResult
+{
+    None,
+    PropagationData,
+    AllData,
+    AllDataAndRecorded
+}
 
 //------------------------------------V
 public readonly struct ActivityTraceId : IEquatable<ActivityTraceId>
