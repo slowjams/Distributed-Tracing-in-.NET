@@ -5,6 +5,36 @@
 //-------------------V
 public class Activity : IDisposable  // In .NET world, a span is represented by an Activity, System.Span class is not related to distributed tracing.
 {
+    private string? _traceState;
+    private State _state;
+    private int _currentChildId;  // A unique number for all children of this activity.
+
+    // State associated with ID.
+    private string? _id;
+    private string? _rootId;
+    // State associated with ParentId.
+    private string? _parentId;
+
+    // W3C formats
+    private string? _parentSpanId;
+    private string? _traceId;
+    private string? _spanId;
+
+    private byte _w3CIdFlags;
+    private byte _parentTraceFlags;
+
+    private TagsLinkedList? _tags;
+    private BaggageLinkedList? _baggage;
+    private DiagLinkedList<ActivityLink>? _links;
+    private DiagLinkedList<ActivityEvent>? _events;
+    private Dictionary<string, object>? _customProperties;
+    private string? _displayName;
+    private ActivityStatusCode _statusCode;
+    private string? _statusDescription;
+    private Activity? _previousActiveActivity;
+
+    public ActivityStatusCode Status => _statusCode;
+   
     private static readonly IEnumerable<KeyValuePair<string, string?>> s_emptyBaggageTags = new KeyValuePair<string, string?>[0];
     private static readonly IEnumerable<KeyValuePair<string, object?>> s_emptyTagObjects = new KeyValuePair<string, object?>[0];
     private static readonly IEnumerable<ActivityLink> s_emptyLinks = new DiagLinkedList<ActivityLink>();
@@ -18,7 +48,12 @@ public class Activity : IDisposable  // In .NET world, a span is represented by 
     // Int gives enough randomization and keeps hex-encoded s_currentRootId 8 chars long for most applications
     private static long s_currentRootId = (uint)GetRandomNumber();
     
-    public Activity(string operationName);
+    public Activity(string operationName)
+    {
+        Source = s_defaultSource;
+        // ...
+        OperationName = operationName ?? string.Empty;
+    }
 
     public static Activity? Current   // <-------------------------------
     {
@@ -59,7 +94,7 @@ public class Activity : IDisposable  // In .NET world, a span is represented by 
         EventHandler<ActivityChangedEventArgs>? handler = CurrentChanged;
         if (handler is null)
         {
-            s_current.Value = activity;  // <-------------------------pact4.
+            s_current.Value = activity;  // <-------------------------pact4. parentActivity is set to Activity.Current
         }
         else
         {
@@ -209,6 +244,48 @@ public class Activity : IDisposable  // In .NET world, a span is represented by 
         return activity;
     }
 
+    private void GenerateW3CId()
+    {
+        if (_traceId is null)
+        {
+            if (!TrySetTraceIdFromParent())
+            {
+                Func<ActivityTraceId>? traceIdGenerator = TraceIdGenerator;
+                ActivityTraceId id = traceIdGenerator == null ? ActivityTraceId.CreateRandom() : traceIdGenerator();
+                _traceId = id.ToHexString();
+            }
+        }
+
+        if (!W3CIdFlagsSet)
+        {
+            TrySetTraceFlagsFromParent();
+        }
+
+        // Create a new SpanID.
+
+        _spanId = ActivitySpanId.CreateRandom().ToHexString();
+    }
+
+    private bool TrySetTraceIdFromParent()  // <---------------------------this is how childActivity uses parents' traceId
+    {
+        if (Parent != null && Parent.IdFormat == ActivityIdFormat.W3C)
+        {
+            _traceId = Parent.TraceId.ToHexString();
+        }
+        else if (_parentId != null && IsW3CId(_parentId))
+        {
+            try
+            {
+                _traceId = ActivityTraceId.CreateFromString(_parentId.AsSpan(3, 32)).ToHexString();
+            }
+            catch
+            {
+            }
+        }
+
+        return _traceId != null;
+    }
+
     public bool IsAllDataRequested { get; set; }
     public ActivityIdFormat IdFormat { get; }
     public ActivityKind Kind { get; }
@@ -355,7 +432,7 @@ public sealed class ActivitySource : IDisposable
         SynchronizedList<ActivityListener>? listeners = _listeners;
         if (listeners == null || listeners.Count == 0)
         {
-            return null;
+            return null;  // <---------------------------won't create an Activity if there is no listener
         }
 
         Activity? activity = null;
@@ -485,8 +562,6 @@ public sealed class ActivitySource : IDisposable
 
     public static void AddActivityListener(ActivityListener listener)
     {
-        ArgumentNullException.ThrowIfNull(listener);
-
         if (s_allListeners.AddIfNotExist(listener))
         {
             s_activeSources.EnumWithAction((source, obj) => {
@@ -695,4 +770,253 @@ public readonly struct ActivitySpanId : IEquatable<ActivitySpanId>
     // same as ActivityTraceId
 }
 //------------------------------------Ʌ
+```
+
+```C#
+//------------------------------------------------V
+public abstract class DistributedContextPropagator
+{
+    private static DistributedContextPropagator s_current = CreateDefaultPropagator();  // <-----------------dcp
+
+    public delegate void PropagatorGetterCallback(object? carrier, string fieldName, out string? fieldValue, out IEnumerable<string>? fieldValues);
+    public delegate void PropagatorSetterCallback(object? carrier, string fieldName, string fieldValue);
+    public abstract IReadOnlyCollection<string> Fields { get; }
+    public abstract void Inject(Activity? activity, object? carrier, PropagatorSetterCallback? setter);  // <-----------------dcp, carrier is HttpRequestMessage
+    public abstract void ExtractTraceIdAndState(object? carrier, PropagatorGetterCallback? getter, out string? traceId, out string? traceState);
+    public abstract IEnumerable<KeyValuePair<string, string?>>? ExtractBaggage(object? carrier, PropagatorGetterCallback? getter);
+
+    public static DistributedContextPropagator Current
+    {
+        get
+        {
+            return s_current;
+        }
+
+        set
+        {
+            s_current = value ?? throw new ArgumentNullException(nameof(value));
+        }
+    }
+
+    public static DistributedContextPropagator CreateDefaultPropagator() => W3CPropagator.Instance;  // <------------------------------
+    public static DistributedContextPropagator CreatePassThroughPropagator() => PassThroughPropagator.Instance;
+    public static DistributedContextPropagator CreateW3CPropagator() => W3CPropagator.Instance;  
+    public static DistributedContextPropagator CreatePreW3CPropagator() => LegacyPropagator.Instance;
+    public static DistributedContextPropagator CreateNoOutputPropagator() => NoOutputPropagator.Instance;
+
+    internal static void InjectBaggage(object? carrier, IEnumerable<KeyValuePair<string, string?>> baggage, PropagatorSetterCallback setter)
+    {
+        using (IEnumerator<KeyValuePair<string, string?>> e = baggage.GetEnumerator())
+        {
+            if (e.MoveNext())
+            {
+                StringBuilder baggageList = new StringBuilder();
+
+                do
+                {
+                    KeyValuePair<string, string?> item = e.Current;
+                    baggageList.Append(WebUtility.UrlEncode(item.Key)).Append('=').Append(WebUtility.UrlEncode(item.Value)).Append(CommaWithSpace);
+                } while (e.MoveNext());
+
+                setter(carrier, CorrelationContext, baggageList.ToString(0, baggageList.Length - 2));
+            }
+        }
+    }
+
+    internal const string TraceParent        = "traceparent";
+    internal const string RequestId          = "Request-Id";
+    internal const string TraceState         = "tracestate";
+    internal const string Baggage            = "baggage";
+    internal const string CorrelationContext = "Correlation-Context";
+    internal const char   Space              = ' ';
+    internal const char   Tab                = (char)9;
+    internal const char   Comma              = ',';
+    internal const char   Semicolon          = ';';
+    internal const string CommaWithSpace     = ", ";
+
+    internal static readonly char [] s_trimmingSpaceCharacters = new char[] { Space, Tab };
+}
+//------------------------------------------------Ʌ
+
+//----------------------------------------------------------------V
+internal sealed class W3CPropagator : DistributedContextPropagator
+{
+    internal static DistributedContextPropagator Instance { get; } = new W3CPropagator();
+
+    private const int MaxBaggageEntriesToEmit = 64;     // Suggested by W3C specs
+    private const int MaxBaggageEncodedLength = 8192;   // Suggested by W3C specs
+    private const int MaxTraceStateEncodedLength = 256; // Suggested by W3C specs
+
+    private const char Equal = '=';
+    private const char Percent = '%';
+    private const char Replacement = '\uFFFD'; // �
+
+    public override IReadOnlyCollection<string> Fields { get; } = new ReadOnlyCollection<string>(new[] { TraceParent, TraceState, Baggage, CorrelationContext });
+
+    public override void Inject(Activity? activity, object? carrier, PropagatorSetterCallback? setter)  // <-----------------dcp, carrier is HttpRequestMessage
+    {
+        if (activity is null || setter is null || activity.IdFormat != ActivityIdFormat.W3C)
+        {
+            return;
+        }
+
+        string? id = activity.Id;
+        if (id is null)
+        {
+            return;
+        }
+
+        setter(carrier, TraceParent, id);  // <---------------------dcp
+        if (activity.TraceStateString is { Length: > 0 } traceState)
+        {
+            InjectTraceState(traceState, carrier, setter);
+        }
+
+        InjectW3CBaggage(carrier, activity.Baggage, setter);
+    }
+
+    public override void ExtractTraceIdAndState(object? carrier, PropagatorGetterCallback? getter, out string? traceId, out string? traceState)
+    {
+        if (getter is null)
+        {
+            traceId = null;
+            traceState = null;
+            return;
+        }
+
+        getter(carrier, TraceParent, out traceId, out _);
+        if (IsInvalidTraceParent(traceId))
+        {
+            traceId = null;
+        }
+
+        getter(carrier, TraceState, out string? traceStateValue, out _);
+        traceState = ValidateTraceState(traceStateValue);
+    }
+
+    public override IEnumerable<KeyValuePair<string, string?>>? ExtractBaggage(object? carrier, PropagatorGetterCallback? getter)
+    {
+        if (getter is null)
+        {
+            return null;
+        }
+
+        getter(carrier, Baggage, out string? theBaggage, out _);
+        if (theBaggage is null)
+        {
+            getter(carrier, CorrelationContext, out theBaggage, out _);
+        }
+
+        TryExtractBaggage(theBaggage, out IEnumerable<KeyValuePair<string, string?>>? baggage);
+
+        return baggage;
+    }
+
+    internal static bool TryExtractBaggage(string? baggageString, out IEnumerable<KeyValuePair<string, string?>>? baggage)
+    {
+        baggage = null;
+        List<KeyValuePair<string, string?>>? baggageList = null;
+
+        if (string.IsNullOrEmpty(baggageString))
+        {
+            return true;
+        }
+
+        ReadOnlySpan<char> baggageSpan = baggageString;
+
+        do
+        {
+            int entrySeparator = baggageSpan.IndexOf(Comma);
+            ReadOnlySpan<char> currentEntry = entrySeparator >= 0 ? baggageSpan.Slice(0, entrySeparator) : baggageSpan;
+
+            int keyValueSeparator = currentEntry.IndexOf(Equal);
+            if (keyValueSeparator <= 0 || keyValueSeparator >= currentEntry.Length - 1)
+            {
+                break; // invalid format
+            }
+
+            ReadOnlySpan<char> keySpan = currentEntry.Slice(0, keyValueSeparator);
+            ReadOnlySpan<char> valueSpan = currentEntry.Slice(keyValueSeparator + 1);
+
+            if (TryDecodeBaggageKey(keySpan, out string? key) && TryDecodeBaggageValue(valueSpan, out string value))
+            {
+                baggageList ??= new List<KeyValuePair<string, string?>>();
+                baggageList.Add(new KeyValuePair<string, string?>(key, value));
+            }
+
+            baggageSpan = entrySeparator >= 0 ? baggageSpan.Slice(entrySeparator + 1) : ReadOnlySpan<char>.Empty;
+        } while (baggageSpan.Length > 0);
+
+        // reverse order for asp.net compatibility.
+        baggageList?.Reverse();
+
+        baggage = baggageList;
+        return baggageList != null;
+    }
+
+    internal static string? ValidateTraceState(string? traceState)
+    {
+        if (string.IsNullOrEmpty(traceState))
+        {
+            return null; // invalid format
+        }
+
+        int processed = 0;
+
+        while (processed < traceState.Length)
+        {
+            ReadOnlySpan<char> traceStateSpan = traceState.AsSpan(processed);
+            int commaIndex = traceStateSpan.IndexOf(Comma);
+            ReadOnlySpan<char> entry = commaIndex >= 0 ? traceStateSpan.Slice(0, commaIndex) : traceStateSpan;
+            int delta = entry.Length + (commaIndex >= 0 ? 1 : 0); // +1 for the comma
+
+            if (processed + delta > MaxTraceStateEncodedLength)
+            {
+                break; // entry exceeds max length
+            }
+
+            int equalIndex = entry.IndexOf(Equal);
+            if (equalIndex <= 0 || equalIndex >= entry.Length - 1)
+            {
+                break; // invalid format
+            }
+
+            if (IsInvalidTraceStateKey(Trim(entry.Slice(0, equalIndex))) || IsInvalidTraceStateValue(TrimSpaceOnly(entry.Slice(equalIndex + 1))))
+            {
+                break; // entry exceeds max length or invalid key/value, skip the whole trace state entries.
+            }
+
+            processed += delta;
+        }
+
+        if (processed > 0)
+        {
+            if (traceState[processed - 1] == Comma)
+            {
+                processed--; // remove the last comma
+            }
+
+            if (processed > 0)
+            {
+                return processed >= traceState.Length ? traceState : traceState.AsSpan(0, processed).ToString();
+            }
+        }
+
+        return null;
+    }
+
+    internal static void InjectTraceState(string traceState, object? carrier, PropagatorSetterCallback setter)
+    {
+
+        string? traceStateValue = ValidateTraceState(traceState);
+        if (traceStateValue is not null)
+        {
+            setter(carrier, TraceState, traceStateValue);  // <---------------------------
+        }
+    }
+
+    internal static void InjectW3CBaggage(object? carrier, IEnumerable<KeyValuePair<string, string?>> baggage, PropagatorSetterCallback setter);
+    // ...   
+}
+//----------------------------------------------------------------Ʌ
 ```

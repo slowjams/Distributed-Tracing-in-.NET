@@ -7,9 +7,11 @@ namespace frontend.Pages;
 public class Meme : PageModel
 {
     private readonly StorageService _storage;
-    public Meme(StorageService storage)
+    private readonly ILogger<Meme> _logger;
+    public Meme(StorageService storage, ILogger<Meme> logger)
     {
         _storage = storage;
+        _logger = logger;
     }
 
     [BindProperty]
@@ -24,6 +26,7 @@ public class Meme : PageModel
     public async Task<IActionResult> OnGet()
     {
         Name = Request.Query["name"]!;
+        _logger.LogDebug("This is from frontend------------------");
 
         try 
         {

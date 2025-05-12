@@ -36,7 +36,9 @@ namespace ConsoleAppTracingDemo
                 Console.WriteLine($"  RA SpanId: {parentActivity.SpanId}");
                 Console.WriteLine("\n");
 
-                //Activity.Current = parentActivity;  // <---------------------
+
+                //Activity.Current = parentActivity;   // no need to explicit set parentActivity to Current,
+                                                       // <----------cact3.0, see how Activity.Start() automatically set parentActivity to Activity.Current
 
                 using (Activity childActivity = ActivitySource.StartActivity("ChildActivity")!)  // Additional child activity within the root activity
                 {

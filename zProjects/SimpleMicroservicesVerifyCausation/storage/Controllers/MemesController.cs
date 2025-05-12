@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using System.Diagnostics;
 
 namespace storage.Controllers;
 
@@ -20,6 +21,9 @@ public class MemesController : ControllerBase
     [Produces("image/png")]
     public async Task<ActionResult> Get(string name, CancellationToken cancellationToken)
     {
+        _logger.LogDebug("This is it------------------");
+        _logger.LogInformation("This is it------------------");
+
         Meme? meme = await _dbContext.Meme.Where(m => m.Name == name).SingleOrDefaultAsync(cancellationToken);
         if (meme != null) {
             _logger.LogInformation("Returning '{meme}', {size} bytes", meme.Name, meme.Data.Length);
