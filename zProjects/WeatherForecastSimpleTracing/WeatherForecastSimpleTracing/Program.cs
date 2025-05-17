@@ -29,7 +29,7 @@ namespace WeatherForecastSimpleTracing
                     .AddHttpClientInstrumentation()
                     .AddConsoleExporter()
                     .AddJaegerExporter()
-                    .AddSource("Tracing.NET")
+                    .AddSource("Tracing.NET")  // <----------------- check acts to see how ActivityListener in tpsact can use this setting
                  );
             //
 

@@ -22,8 +22,29 @@ public class Program
                 .AddHttpClientInstrumentation() // <-------------------add listener(HttpHandlerDiagnosticListener) for ActivitySource("System.Net.Http") 
                 .AddConsoleExporter()
                 .AddJaegerExporter()
-                .AddSource("Tracing.NET")
+                .AddSource("Tracing.NET")  // <----------------- check acts to see how ActivityListener in tpsact can use this setting
         //...
+    }
+}
+```
+```C#
+public class WeatherForecastController : ControllerBase
+{
+    // ...
+    private static readonly ActivitySource _activitySource = new("Tracing.NET");
+
+    [HttpGet("OutgoingHttp")]
+    public async Task OutgoingHttpRequest()
+    {
+        using var activity = _activitySource.StartActivity("AnotherOne");  // <-------------check tpsact see why ActivityListener is not null
+        activity.SetTag("myTags.count", 1);
+        var userId = Activity.Current.GetBaggageItem("UserId");
+        activity.AddTag("UserId", userId);
+
+        var client = new HttpClient();
+
+        var response = await client.GetAsync("https://code-maze.com");
+        response.EnsureSuccessStatusCode();
     }
 }
 ```
@@ -75,7 +96,7 @@ internal sealed class TelemetryHostedService : IHostedService
         if (meterProvider == null)
             HostingExtensionsEventSource.Log.MeterProviderNotRegistered();
 
-        var tracerProvider = serviceProvider!.GetService<TracerProvider>();  // <--------ote1.0
+        var tracerProvider = serviceProvider!.GetService<TracerProvider>();  // <-----------------------------------------ote1.0
         if (tracerProvider == null)
             HostingExtensionsEventSource.Log.TracerProviderNotRegistered();
 
@@ -787,6 +808,7 @@ public static class TracerProviderBuilderExtensions
             if (builder is TracerProviderBuilderSdk tracerProviderBuilderSdk)
             {
                 tracerProviderBuilderSdk.AddProcessor(processor);  // <--------------------------------------coe1.0
+                                                                   // processor is new SimpleActivityExportProcessor(new ConsoleActivityExporter(options))
             }
         });
 
@@ -2286,7 +2308,7 @@ internal sealed class TracerProviderSdk : TracerProvider
                     return;
 
                 if (SuppressInstrumentationScope.IncrementIfTriggered() == 0)
-                    this.processor?.OnStart(activity);   // <-----------------------------pro
+                    this.processor?.OnStart(activity);   // <-----------------------------pro, note that OnStart does nothing
             };
 
             activityListener.ActivityStopped = activity =>
@@ -2300,7 +2322,7 @@ internal sealed class TracerProviderSdk : TracerProvider
                     return;
 
                 if (SuppressInstrumentationScope.DecrementIfTriggered() == 0)
-                    this.processor?.OnEnd(activity);
+                    this.processor?.OnEnd(activity);   // <------------pro, OnEnd calls OnExport, that's why Console print childActivity before parentActiviy, see actp
             };
         }
         else
@@ -2367,7 +2389,7 @@ internal sealed class TracerProviderSdk : TracerProvider
             }
             else
             {
-                var activitySources = new HashSet<string>(state.Sources, StringComparer.OrdinalIgnoreCase);
+                var activitySources = new HashSet<string>(state.Sources, StringComparer.OrdinalIgnoreCase);  // <--------------------------acts
 
                 if (this.supportLegacyActivity)
                 {
@@ -2375,7 +2397,7 @@ internal sealed class TracerProviderSdk : TracerProvider
                 }
 
                 // function which takes ActivitySource and returns true/false to indicate if it should be subscribed to or not.
-                activityListener.ShouldListenTo = activitySource => activitySources.Contains(activitySource.Name);
+                activityListener.ShouldListenTo = activitySource => activitySources.Contains(activitySource.Name);  // <--------------------------acts
             }
         }
         else
@@ -2772,7 +2794,7 @@ public class CompositeProcessor<T> : BaseProcessor<T>
     {
         for (var cur = this.Head; cur != null; cur = cur.Next)
         {
-            cur.Value.OnStart(data);
+            cur.Value.OnStart(data);   // <---------------------------pro
         }
     }
 
@@ -3734,6 +3756,50 @@ public class ConsoleActivityExporter : ConsoleExporter<Activity>
 }
 //----------------------------------Ʌ
 ```
+```yml
+# actp, childActivity is printed before parentActivity because Console only logs Activity when it is stopped
+...
+Activity.TraceId:            37285f6aa3b5b2cd9bee843c581e9368
+Activity.SpanId:             fd793a06db01a828
+Activity.TraceFlags:         Recorded
+Activity.ParentSpanId:       d0017112214dc65f  # <---------------childActivity
+Activity.DisplayName:        AnotherOne
+Activity.Kind:               Internal
+Activity.StartTime:          2025-05-16T12:59:10.4698506Z
+Activity.Duration:           00:00:01.2607058
+Instrumentation scope (ActivitySource):
+    Name: Tracing.NET
+Resource associated with Activity:
+    telemetry.sdk.name: opentelemetry
+    telemetry.sdk.language: dotnet
+    telemetry.sdk.version: 1.12.0
+    service.name: unknown_service:WeatherForecastSimpleTracing
+
+Activity.TraceId:            37285f6aa3b5b2cd9bee843c581e9368
+Activity.SpanId:             d0017112214dc65f   # <---------------parentActivity
+Activity.TraceFlags:         Recorded
+Activity.DisplayName:        GET WeatherForecast/OutgoingHttp
+Activity.Kind:               Server
+Activity.StartTime:          2025-05-16T12:59:10.4533497Z
+Activity.Duration:           00:00:01.2822832
+Activity.Tags:
+    server.address: localhost
+    server.port: 5164
+    http.request.method: GET
+    url.scheme: http
+    url.path: /weatherforecast/OutgoingHttp
+    network.protocol.version: 1.1
+    user_agent.original: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36
+    http.route: WeatherForecast/OutgoingHttp
+    http.response.status_code: 200
+Instrumentation scope (ActivitySource):
+    Name: Microsoft.AspNetCore
+Resource associated with Activity:
+    telemetry.sdk.name: opentelemetry
+    telemetry.sdk.language: dotnet
+    telemetry.sdk.version: 1.12.0
+    service.name: unknown_service:WeatherForecastSimpleTracing
+```
 
 ```C#
 //------------------------------------------------V
@@ -3747,8 +3813,6 @@ public static class JaegerExporterHelperExtensions
 
     public static TracerProviderBuilder AddJaegerExporter(this TracerProviderBuilder builder, string name, Action<JaegerExporterOptions> configure)
     {
-        Guard.ThrowIfNull(builder);
-
         name ??= Options.DefaultName;
 
         builder.ConfigureServices(services =>

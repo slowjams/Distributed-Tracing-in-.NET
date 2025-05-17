@@ -5,11 +5,11 @@ namespace ConsoleAppTracingDemo
     class Program
     {
         private static readonly ActivitySource ActivitySource = new ActivitySource("DemoApp.Tracing");
-        static void Mainzz(string[] args)
+        static void Main(string[] args)
         {
             using var listener = new ActivityListener
             {
-                ShouldListenTo = source => source.Name == "DemoApp.Tracing", // Listen only to our ActivitySource
+                ShouldListenTo = source => source.Name == "DemoApp.Tracing", // listen only to our ActivitySource
                 Sample = (ref ActivityCreationOptions<ActivityContext> options) => ActivitySamplingResult.AllDataAndRecorded,
                 ActivityStarted = activity => Console.WriteLine($"Activity Started: {activity.DisplayName}"),
                 ActivityStopped = activity =>

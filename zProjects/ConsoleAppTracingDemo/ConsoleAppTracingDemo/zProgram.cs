@@ -9,7 +9,7 @@ namespace ConsoleAppTracingDemo
 {
     internal class Programz
     {
-        static void Main(string[] args)
+        static void Mainz(string[] args)
         {
             var act = new Activity("MyActivity").Start();
 
