@@ -171,12 +171,12 @@ class HostingApplicationDiagnosticsObserver : IObserver<KeyValuePair<string, obj
     {
         switch (receivedEvent.Key)
         {
-            case "Microsoft.AspNetCore.Hosting.HttpRequestIn.Start":
+            case "Microsoft.AspNetCore.Hosting.HttpRequestIn.Start":  // <-----------------------------dlr3.3
                 Console.WriteLine($"Activityy is: - activity id: {Activity.Current.Id}, parentactivity Id: {Activity.Current.ParentId}");
 
                 break;
 
-            case "Microsoft.AspNetCore.Hosting.BeginRequest":
+            case "Microsoft.AspNetCore.Hosting.BeginRequest":       // <-------------------------------dlr4.0
                 Console.WriteLine($"Activityy is: - activity id: {Activity.Current.Id}, parentactivity Id: {Activity.Current.ParentId}");
 
                 break;

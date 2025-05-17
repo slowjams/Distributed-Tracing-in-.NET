@@ -104,6 +104,27 @@ public class Activity : IDisposable  // In .NET world, a span is represented by 
         }
     }
 
+    public void Stop()
+    {
+        if (_id == null && _spanId == null)
+        {
+            NotifyError(new InvalidOperationException(SR.ActivityNotStarted));
+            return;
+        }
+
+        if (!IsStopped)
+        {
+            IsStopped = true;
+
+            if (Duration == TimeSpan.Zero)
+            {
+                SetEndTime(GetUtcNow());
+            }
+
+            Source.NotifyActivityStop(this);
+            SetCurrent(_previousActiveActivity);
+        }
+    }
     public Activity Start()   // <-------------------------pact3.0, cact3.0
     {
         if (_id != null || _spanId != null)
@@ -321,7 +342,6 @@ public class Activity : IDisposable  // In .NET world, a span is represented by 
     public Activity SetParentId(ActivityTraceId traceId, ActivitySpanId spanId, ActivityTraceFlags activityTraceFlags = ActivityTraceFlags.None);
     public Activity SetStartTime(DateTime startTimeUtc);
     public Activity SetTag(string key, object? value);
-    public void Stop();
 }
 //-------------------Ʌ 
 

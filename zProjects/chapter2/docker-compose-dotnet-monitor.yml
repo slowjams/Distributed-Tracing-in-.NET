@@ -1,0 +1,75 @@
+version: "3.9"
+services:
+  frontend:
+    mem_limit: 256m
+    cpus: 0.1
+    build:
+      context: ./
+      dockerfile: ./frontend/Dockerfile
+    ports:
+      - "5051:5051"
+    depends_on:
+      - storage
+    environment:
+      - ASPNETCORE_URLS=http://+:5051
+      - Storage__Endpoint=http://storage:5050
+    volumes:
+      - ./tmp/frontend-tmp:/tmp
+  storage:
+    cpus: 0.1
+    mem_limit: 256m
+    build:
+      context: ./
+      dockerfile: ./storage/Dockerfile
+    ports:
+      - "5050:5050"
+    environment:
+      - ASPNETCORE_URLS=http://+:5050
+      # for demo purposes only, make sure to pass environment securely
+      - ConnectionStrings__MySql=server=mysql;user=root;password=pwd;database=memes
+    volumes:
+      - ./tmp/storage-tmp:/tmp
+  mysql:
+    image: docker.io/bitnami/mysql:8.0.33
+    ports:
+      - '3306:3306'
+    volumes:
+      - 'mysql_data:/bitnami/mysql/data'
+    environment:
+      # for demo purposes only, make sure to pass environment securely
+      - MYSQL_ROOT_PASSWORD=pwd
+  dotnetmonitor-frontend:
+    image: mcr.microsoft.com/dotnet/monitor:6.2.2
+    # for demo purposes only, please set up API key for real usage
+    command: --no-auth
+    ports:
+      - "52343:52343"
+      - "52345:52345"
+    environment:
+      - DOTNET_URLS=http://+:52343
+      - DOTNET_Metrics__Endpoints=http://+:52345
+    volumes:
+      - ./tmp/frontend-tmp:/tmp
+  dotnetmonitor-storage:
+    image: mcr.microsoft.com/dotnet/monitor:6.2.2
+    command: --no-auth
+    ports:
+      - "52333:52333"
+      - "52335:52335"
+    environment:
+      - DOTNET_URLS=http://+:52333
+      - DOTNET_Metrics__Endpoints=http://+:52335
+    volumes:
+      - ./tmp/storage-tmp:/tmp
+  prometheus:
+    image: prom/prometheus:v2.44.0
+    volumes:
+      - ./configs/prometheus-dotnet-monitor.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    depends_on:
+      - dotnetmonitor-frontend
+      - dotnetmonitor-storage
+volumes:
+  mysql_data:
+    driver: local

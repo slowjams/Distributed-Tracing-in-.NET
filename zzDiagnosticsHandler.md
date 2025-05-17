@@ -194,7 +194,7 @@ internal sealed class DiagnosticsHandler : HttpMessageHandlerStage
                     Write(diagnosticListener, DiagnosticsHandlerLoggingStrings.RequestActivityStopName, new ActivityStopData(response, request, taskStatus)); // <-------------dcp
                 }
 
-                activity.Stop();
+                activity.Stop();  // <----------------------------------------
             }
 
             // Try to write System.Net.Http.Response event (deprecated)

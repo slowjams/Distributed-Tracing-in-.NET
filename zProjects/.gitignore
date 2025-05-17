@@ -413,3 +413,53 @@ FodyWeavers.xsd
 # Built Visual Studio Code Extensions
 *.vsix
 
+# Exclude frontend assets in wwwroot or similar folders
+**/wwwroot/css/
+**/wwwroot/js/
+**/wwwroot/lib/
+**/wwwroot/node_modules/
+**/wwwroot/fonts/
+**/wwwroot/images/
+**/wwwroot/bootstrap*
+**/wwwroot/**/*.css
+**/wwwroot/**/*.js
+**/wwwroot/**/*.map
+**/wwwroot/**/*.scss
+**/wwwroot/**/*.less
+**/wwwroot/**/*.ts
+**/wwwroot/**/*.png
+**/wwwroot/**/*.jpg
+**/wwwroot/**/*.jpeg
+**/wwwroot/**/*.gif
+**/wwwroot/**/*.svg
+**/wwwroot/**/*.ico
+
+**/bin/
+**/obj/
+**/out/
+**/*.user
+**/*.suo
+**/*.userosscache
+**/*.sln.docstates
+
+# Node/npm/yarn
+**/node_modules/
+**/npm-debug.log*
+**/yarn-debug.log*
+**/yarn-error.log*
+**/package-lock.json
+**/yarn.lock
+
+# Others
+**/*.log
+**/*.vspscc
+**/*.vssscc
+**/_ReSharper*/
+**/*.DotSettings.user
+**/*.dbmdl
+**/*.pdb
+**/*.mdb
+**/*.cache
+**/*.bak
+**/*.backup
+**/*.tmp
