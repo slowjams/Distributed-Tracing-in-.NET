@@ -14,7 +14,8 @@ namespace WeatherForecastSimpleTracing
             //
             builder.Services
                 .AddOpenTelemetry()
-                .WithTracing(builder => builder
+                .WithTracing(builder =>  // TracerProviderBuilder
+                    builder
                     .AddAspNetCoreInstrumentation(opt =>
                     {
                         opt.EnrichWithHttpRequest = (activity, httpRequest) =>
@@ -24,7 +25,7 @@ namespace WeatherForecastSimpleTracing
                             activity.SetTag("myTags.url", httpRequest.Path);
                             activity.SetBaggage("UserId", "1234");
                         };
-                     })
+                    })
                     .AddHttpClientInstrumentation()
                     .AddConsoleExporter()
                     .AddJaegerExporter()

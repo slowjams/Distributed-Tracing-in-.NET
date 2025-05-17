@@ -8,13 +8,21 @@ public class Program
         // ...
         builder.Services
             .AddOpenTelemetry()
-            .WithTracing(builder => builder
-                .AddAspNetCoreInstrumentation()
-                .AddHttpClientInstrumentation()
+            .WithTracing(builder =>  // builder is TracerProviderBuilder
+                builder
+                .AddAspNetCoreInstrumentation(opt =>   // <------------add listener(HttpInListener) for ActivitySource("Microsoft.AspNetCore") 
+                {
+                    opt.EnrichWithHttpRequest = (activity, httpRequest) =>  // opt is AspNetCoreTraceInstrumentationOptions
+                    {
+                        activity.SetTag("myTags.method", httpRequest.Method);
+                        activity.SetTag("myTags.url", httpRequest.Path);
+                        activity.SetBaggage("UserId", "1234");
+                    };
+                })
+                .AddHttpClientInstrumentation() // <-------------------add listener(HttpHandlerDiagnosticListener) for ActivitySource("System.Net.Http") 
                 .AddConsoleExporter()
                 .AddJaegerExporter()
                 .AddSource("Tracing.NET")
-             );
         //...
     }
 }
@@ -27,14 +35,14 @@ public class Program
 //-------------------------------------------------V
 public static class OpenTelemetryServicesExtensions
 {
-    public static OpenTelemetryBuilder AddOpenTelemetry(this IServiceCollection services)
+    public static OpenTelemetryBuilder AddOpenTelemetry(this IServiceCollection services)  // <--------------ote0
     {
         if (!services.Any((ServiceDescriptor d) => d.ServiceType == typeof(IHostedService) && d.ImplementationType == typeof(TelemetryHostedService)))
         {
-            services.Insert(0, ServiceDescriptor.Singleton<IHostedService, TelemetryHostedService>());
+            services.Insert(0, ServiceDescriptor.Singleton<IHostedService, TelemetryHostedService>());  // <--------ote0.1. to make sure it run even before GenericWebHostService
         }
 
-        return new(services);
+        return new OpenTelemetryBuilder(services); // <----------------------------ote1.1.
     }
 }
 //-------------------------------------------------Ʌ
@@ -67,7 +75,7 @@ internal sealed class TelemetryHostedService : IHostedService
         if (meterProvider == null)
             HostingExtensionsEventSource.Log.MeterProviderNotRegistered();
 
-        var tracerProvider = serviceProvider!.GetService<TracerProvider>();
+        var tracerProvider = serviceProvider!.GetService<TracerProvider>();  // <--------ote1.0
         if (tracerProvider == null)
             HostingExtensionsEventSource.Log.TracerProviderNotRegistered();
 
@@ -222,6 +230,369 @@ public class TracerProvider : BaseProvider
     }
 }
 //-------------------------Ʌ
+
+//-------------------------V
+public class LoggerProvider : BaseProvider
+{
+    protected LoggerProvider() { }
+
+    public Logger GetLogger() => this.GetLogger(name: null, version: null);
+
+    public Logger GetLogger(string? name) => this.GetLogger(name, version: null);
+
+    public Logger GetLogger(string? name, string? version)
+    {
+        if (!this.TryCreateLogger(name, out var logger))
+        {
+            return NoopLogger;
+        }
+
+        logger!.SetInstrumentationScope(version);
+
+        return logger;
+    }
+
+    internal virtual bool TryCreateLogger(string? name, out Logger? logger)
+    {
+        logger = null;
+        return false;
+    }
+}
+//-------------------------Ʌ
+
+//--------------------------------------------V
+internal sealed class LoggerProviderBuilderSdk : LoggerProviderBuilder, ILoggerProviderBuilder
+{
+    private const string DefaultInstrumentationVersion = "1.0.0.0";
+
+    private readonly IServiceProvider serviceProvider;
+    private LoggerProviderSdk? loggerProvider;
+
+    public LoggerProviderBuilderSdk(IServiceProvider serviceProvider)
+    {
+        this.serviceProvider = serviceProvider;
+    }
+
+    public List<InstrumentationRegistration> Instrumentation { get; } = new();
+
+    public ResourceBuilder? ResourceBuilder { get; private set; }
+
+    public LoggerProvider? Provider => this.loggerProvider;
+
+    public List<BaseProcessor<LogRecord>> Processors { get; } = new();
+
+    public void RegisterProvider(LoggerProviderSdk loggerProvider)
+    {
+        if (this.loggerProvider != null)
+            throw new NotSupportedException("LoggerProvider cannot be accessed while build is executing.");
+
+        this.loggerProvider = loggerProvider;
+    }
+
+    public override LoggerProviderBuilder AddInstrumentation<TInstrumentation>(Func<TInstrumentation> instrumentationFactory)
+    {
+        this.Instrumentation.Add(
+            new InstrumentationRegistration(
+                typeof(TInstrumentation).Name,
+                typeof(TInstrumentation).Assembly.GetName().Version?.ToString() ?? DefaultInstrumentationVersion,
+                instrumentationFactory!()));
+
+        return this;
+    }
+
+    public LoggerProviderBuilder ConfigureResource(Action<ResourceBuilder> configure)
+    {
+        var resourceBuilder = this.ResourceBuilder ??= ResourceBuilder.CreateDefault();
+
+        configure!(resourceBuilder);
+
+        return this;
+    }
+
+    public LoggerProviderBuilder SetResourceBuilder(ResourceBuilder resourceBuilder)
+    {
+        this.ResourceBuilder = resourceBuilder;
+
+        return this;
+    }
+
+    public LoggerProviderBuilder AddProcessor(BaseProcessor<LogRecord> processor)
+    {
+        this.Processors.Add(processor!);
+
+        return this;
+    }
+
+    public LoggerProviderBuilder ConfigureBuilder(Action<IServiceProvider, LoggerProviderBuilder> configure)
+    {
+        configure!(this.serviceProvider, this);
+
+        return this;
+    }
+
+    public LoggerProviderBuilder ConfigureServices(Action<IServiceCollection> configure)
+    {
+        throw new NotSupportedException("Services cannot be configured after ServiceProvider has been created.");
+    }
+
+    LoggerProviderBuilder IDeferredLoggerProviderBuilder.Configure(Action<IServiceProvider, LoggerProviderBuilder> configure)
+        => this.ConfigureBuilder(configure);
+
+    internal readonly struct InstrumentationRegistration
+    {
+        public readonly string Name;
+        public readonly string Version;
+        public readonly object? Instance;
+
+        internal InstrumentationRegistration(string name, string version, object? instance)
+        {
+            this.Name = name;
+            this.Version = version;
+            this.Instance = instance;
+        }
+    }
+}
+//--------------------------------------------Ʌ
+
+//-------------------------------------V
+internal sealed class LoggerProviderSdk : LoggerProvider
+{
+    internal readonly IServiceProvider ServiceProvider;
+    internal IDisposable? OwnedServiceProvider;
+    internal bool Disposed;
+    internal int ShutdownCount;
+
+    private readonly List<object> instrumentations = [];
+    private ILogRecordPool? threadStaticPool = LogRecordThreadStaticPool.Instance;
+
+    public LoggerProviderSdk(IServiceProvider serviceProvider, bool ownsServiceProvider)
+    {
+
+        var state = serviceProvider!.GetRequiredService<LoggerProviderBuilderSdk>();
+        state.RegisterProvider(this);
+
+        this.ServiceProvider = serviceProvider!;
+
+        if (ownsServiceProvider)
+        {
+            this.OwnedServiceProvider = serviceProvider as IDisposable;
+            Debug.Assert(this.OwnedServiceProvider != null, "ownedServiceProvider was null");
+        }
+
+        OpenTelemetrySdkEventSource.Log.LoggerProviderSdkEvent("Building LoggerProvider.");
+
+        var configureProviderBuilders = serviceProvider!.GetServices<IConfigureLoggerProviderBuilder>();
+        foreach (var configureProviderBuilder in configureProviderBuilders)
+            configureProviderBuilder.ConfigureBuilder(serviceProvider!, state);
+
+        var resourceBuilder = state.ResourceBuilder ?? ResourceBuilder.CreateDefault();
+        resourceBuilder.ServiceProvider = serviceProvider;
+        this.Resource = resourceBuilder.Build();
+
+        // Note: Linq OrderBy performs a stable sort, which is a requirement here
+        foreach (var processor in state.Processors.OrderBy(p => p.PipelineWeight))
+            this.AddProcessor(processor);
+
+        StringBuilder instrumentationFactoriesAdded = new StringBuilder();
+
+        foreach (var instrumentation in state.Instrumentation)
+        {
+            if (instrumentation.Instance is not null)
+                this.instrumentations.Add(instrumentation.Instance);
+
+            instrumentationFactoriesAdded.Append(instrumentation.Name);
+            instrumentationFactoriesAdded.Append(';');
+        }
+
+        if (instrumentationFactoriesAdded.Length != 0)
+        {
+            instrumentationFactoriesAdded.Remove(instrumentationFactoriesAdded.Length - 1, 1);
+            OpenTelemetrySdkEventSource.Log.LoggerProviderSdkEvent($"Instrumentations added = \"{instrumentationFactoriesAdded}\".");
+        }
+
+        OpenTelemetrySdkEventSource.Log.LoggerProviderSdkEvent("LoggerProviderSdk built successfully.");
+    }
+
+    public Resource Resource { get; }
+
+    public List<object> Instrumentations => this.instrumentations;
+
+    public BaseProcessor<LogRecord>? Processor { get; private set; }
+
+    public ILogRecordPool LogRecordPool => this.threadStaticPool ?? LogRecordSharedPool.Current;
+
+    public static bool ContainsBatchProcessor(BaseProcessor<LogRecord> processor)
+    {
+        if (processor is BatchExportProcessor<LogRecord>)
+        {
+            return true;
+        }
+        else if (processor is CompositeProcessor<LogRecord> compositeProcessor)
+        {
+            var current = compositeProcessor.Head;
+            while (current != null)
+            {
+                if (ContainsBatchProcessor(current.Value))
+                {
+                    return true;
+                }
+
+                current = current.Next;
+            }
+        }
+
+        return false;
+    }
+
+    public void AddProcessor(BaseProcessor<LogRecord> processor)
+    {
+        Guard.ThrowIfNull(processor);
+
+        processor.SetParentProvider(this);
+
+        if (this.threadStaticPool != null && ContainsBatchProcessor(processor))
+        {
+            OpenTelemetrySdkEventSource.Log.LoggerProviderSdkEvent("Using shared thread pool.");
+
+            this.threadStaticPool = null;
+        }
+
+        StringBuilder processorAdded = new StringBuilder();
+
+        if (this.Processor == null)
+        {
+            processorAdded.Append("Setting processor to '");
+            processorAdded.Append(processor);
+            processorAdded.Append('\'');
+
+            this.Processor = processor;
+        }
+        else if (this.Processor is CompositeProcessor<LogRecord> compositeProcessor)
+        {
+            processorAdded.Append("Adding processor '");
+            processorAdded.Append(processor);
+            processorAdded.Append("' to composite processor");
+
+            compositeProcessor.AddProcessor(processor);
+        }
+        else
+        {
+            processorAdded.Append("Creating new composite processor and adding new processor '");
+            processorAdded.Append(processor);
+            processorAdded.Append('\'');
+
+            var newCompositeProcessor = new CompositeProcessor<LogRecord>(
+            [
+                this.Processor,
+            ]);
+            newCompositeProcessor.SetParentProvider(this);
+            newCompositeProcessor.AddProcessor(processor);
+            this.Processor = newCompositeProcessor;
+        }
+
+        OpenTelemetrySdkEventSource.Log.LoggerProviderSdkEvent($"Completed adding processor = \"{processorAdded}\".");
+    }
+
+    public bool ForceFlush(int timeoutMilliseconds = Timeout.Infinite)
+    {
+        try
+        {
+            return this.Processor?.ForceFlush(timeoutMilliseconds) ?? true;
+        }
+        catch (Exception ex)
+        {
+            OpenTelemetrySdkEventSource.Log.LoggerProviderException(nameof(this.ForceFlush), ex);
+            return false;
+        }
+    }
+
+    public bool Shutdown(int timeoutMilliseconds)
+    {
+        if (Interlocked.Increment(ref this.ShutdownCount) > 1)
+            return false; // shutdown already called
+
+        try
+        {
+            return this.Processor?.Shutdown(timeoutMilliseconds) ?? true;
+        }
+        catch (Exception ex)
+        {
+            OpenTelemetrySdkEventSource.Log.LoggerProviderException(nameof(this.Shutdown), ex);
+            return false;
+        }
+    }
+
+    protected override bool TryCreateLogger(string? name,out Logger? logger)
+    {
+        logger = new LoggerSdk(this, name);
+        return true;
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (!this.Disposed)
+        {
+            if (disposing)
+            {
+                foreach (var item in this.instrumentations)
+                    (item as IDisposable)?.Dispose();
+
+                this.instrumentations.Clear();
+
+                // Wait for up to 5 seconds grace period
+                this.Processor?.Shutdown(5000);
+                this.Processor?.Dispose();
+                this.Processor = null;
+
+                this.OwnedServiceProvider?.Dispose();
+                this.OwnedServiceProvider = null;
+            }
+
+            this.Disposed = true;
+            OpenTelemetrySdkEventSource.Log.ProviderDisposed(nameof(LoggerProviderSdk));
+        }
+
+        base.Dispose(disposing);
+    }
+}
+//-------------------------------------Ʌ
+
+//-----------------------------V
+internal sealed class LoggerSdk : Logger
+{
+    private readonly LoggerProviderSdk loggerProvider;
+
+    public LoggerSdk(LoggerProviderSdk loggerProvider, string? name) : base(name)
+    {
+
+        this.loggerProvider = loggerProvider;
+    }
+
+    public override void EmitLog(in LogRecordData data, in LogRecordAttributeList attributes)
+    {
+        var provider = this.loggerProvider;
+        var processor = provider.Processor;
+        if (processor != null)
+        {
+            var pool = provider.LogRecordPool;
+
+            var logRecord = pool.Rent();
+
+            logRecord.Data = data;
+            logRecord.ILoggerData = default;
+
+            logRecord.Logger = this;
+
+            logRecord.AttributeData = attributes.Export(ref logRecord.AttributeStorage);
+
+            processor.OnEnd(logRecord);
+
+            // attempt to return the LogRecord to the pool. This will no-op if a batch exporter has added a reference.
+            pool.Return(logRecord);
+        }
+    }
+}
+//-----------------------------Ʌ
 ```
 
 ```C#
@@ -230,7 +601,7 @@ internal static class ProviderBuilderServiceCollectionExtensions
 {
     public static IServiceCollection AddOpenTelemetryLoggerProviderBuilderServices(this IServiceCollection services)
     {
-        services!.TryAddSingleton<LoggerProviderBuilderSdk>();
+        services!.TryAddSingleton<LoggerProviderBuilderSdk>();  // <----------------------------------
         services!.RegisterOptionsFactory(configuration => new BatchExportLogRecordProcessorOptions(configuration));
         services!.RegisterOptionsFactory(
             (sp, configuration, name) => new LogRecordExportProcessorOptions(
@@ -415,7 +786,7 @@ public static class TracerProviderBuilderExtensions
         {
             if (builder is TracerProviderBuilderSdk tracerProviderBuilderSdk)
             {
-                tracerProviderBuilderSdk.AddProcessor(processor);
+                tracerProviderBuilderSdk.AddProcessor(processor);  // <--------------------------------------coe1.0
             }
         });
 
@@ -459,6 +830,190 @@ public static class TracerProviderBuilderExtensions
 }
 //-------------------------------------------------Ʌ
 
+//---------------------------------------------------------------------------------V
+public static class OpenTelemetryDependencyInjectionTracerProviderBuilderExtensions
+{
+    public static TracerProviderBuilder AddInstrumentation<T>(this TracerProviderBuilder tracerProviderBuilder) where T : class
+    {
+        tracerProviderBuilder.ConfigureServices(delegate (IServiceCollection services)
+        {
+            services.TryAddSingleton<T>();
+        });
+        tracerProviderBuilder.ConfigureBuilder(delegate (IServiceProvider sp, TracerProviderBuilder builder)
+        {
+            builder.AddInstrumentation(sp.GetRequiredService<T>);
+        });
+        return tracerProviderBuilder;
+    }
+
+    public static TracerProviderBuilder AddInstrumentation<T>(this TracerProviderBuilder tracerProviderBuilder, T instrumentation) where T : class
+    {
+        T instrumentation2 = instrumentation;
+        Guard.ThrowIfNull(instrumentation2, "instrumentation");
+        tracerProviderBuilder.ConfigureBuilder(delegate (IServiceProvider sp, TracerProviderBuilder builder)
+        {
+            builder.AddInstrumentation(() => instrumentation2);
+        });
+        return tracerProviderBuilder;
+    }
+
+    public static TracerProviderBuilder AddInstrumentation<T>(this TracerProviderBuilder tracerProviderBuilder, Func<IServiceProvider, T> instrumentationFactory) where T : class
+    {
+        Func<IServiceProvider, T> instrumentationFactory2 = instrumentationFactory;
+        Guard.ThrowIfNull(instrumentationFactory2, "instrumentationFactory");
+        tracerProviderBuilder.ConfigureBuilder(delegate (IServiceProvider sp, TracerProviderBuilder builder)
+        {
+            IServiceProvider sp2 = sp;
+            builder.AddInstrumentation(() => instrumentationFactory2(sp2));
+        });
+        return tracerProviderBuilder;
+    }
+
+    //     The supplied OpenTelemetry.Trace.TracerProviderBuilder for chaining.
+    public static TracerProviderBuilder AddInstrumentation<T>(this TracerProviderBuilder tracerProviderBuilder, Func<IServiceProvider, TracerProvider, T> instrumentationFactory) where T : class
+    {
+        Func<IServiceProvider, TracerProvider, T> instrumentationFactory2 = instrumentationFactory;
+        tracerProviderBuilder.ConfigureBuilder(delegate (IServiceProvider sp, TracerProviderBuilder builder)
+        {
+            IServiceProvider sp2 = sp;
+            ITracerProviderBuilder iTracerProviderBuilder = builder as ITracerProviderBuilder;
+            if (iTracerProviderBuilder != null && iTracerProviderBuilder.Provider != null)
+            {
+                builder.AddInstrumentation(() => instrumentationFactory2(sp2, iTracerProviderBuilder.Provider));
+            }
+        });
+        return tracerProviderBuilder;
+    }
+
+    public static TracerProviderBuilder ConfigureServices(this TracerProviderBuilder tracerProviderBuilder, Action<IServiceCollection> configure)
+    {
+        if (tracerProviderBuilder is ITracerProviderBuilder tracerProviderBuilder2)
+            tracerProviderBuilder2.ConfigureServices(configure);
+
+        return tracerProviderBuilder;
+    }
+
+    internal static TracerProviderBuilder ConfigureBuilder(this TracerProviderBuilder tracerProviderBuilder, Action<IServiceProvider, TracerProviderBuilder> configure)
+    {
+        if (tracerProviderBuilder is IDeferredTracerProviderBuilder deferredTracerProviderBuilder)
+        {
+            deferredTracerProviderBuilder.Configure(configure);
+        }
+
+        return tracerProviderBuilder;
+    }
+}
+//---------------------------------------------------------------------------------Ʌ
+
+//------------------------------------------------------------------------------------V
+public static class OpenTelemetryDependencyInjectionTracingServiceCollectionExtensions
+{
+    public static IServiceCollection ConfigureOpenTelemetryTracerProvider(this IServiceCollection services, Action<TracerProviderBuilder> configure)
+    {
+        configure(new TracerProviderServiceCollectionBuilder(services));
+
+        return services;
+    }
+
+    public static IServiceCollection ConfigureOpenTelemetryTracerProvider(this IServiceCollection services, Action<IServiceProvider, TracerProviderBuilder> configure)
+    {
+        services.AddSingleton<IConfigureTracerProviderBuilder>(new ConfigureTracerProviderBuilderCallbackWrapper(configure));  // <-------------------------------ote4.4
+
+        return services;
+    }
+
+    private sealed class ConfigureTracerProviderBuilderCallbackWrapper : IConfigureTracerProviderBuilder
+    {
+        private readonly Action<IServiceProvider, TracerProviderBuilder> configure;
+
+        public ConfigureTracerProviderBuilderCallbackWrapper(Action<IServiceProvider, TracerProviderBuilder> configure)
+        {
+            this.configure = configure;
+        }
+
+        public void ConfigureBuilder(IServiceProvider serviceProvider, TracerProviderBuilder tracerProviderBuilder)
+        {
+            this.configure(serviceProvider, tracerProviderBuilder);  // <-------------------------------ote4.5
+            // configure is (sp, builder) => builder.AddInstrumentation(sp => new AspNetCoreInstrumentation(new HttpInListener(options)));
+        }
+    }
+}
+//------------------------------------------------------------------------------------Ʌ
+
+//--------------------------------------------------------------------------V
+public static class AspNetCoreInstrumentationTracerProviderBuilderExtensions
+{
+    public static TracerProviderBuilder AddAspNetCoreInstrumentation(this TracerProviderBuilder builder)
+        => AddAspNetCoreInstrumentation(builder, name: null, configureAspNetCoreTraceInstrumentationOptions: null);
+
+    public static TracerProviderBuilder AddAspNetCoreInstrumentation(this TracerProviderBuilder builder, Action<AspNetCoreTraceInstrumentationOptions>? configureAspNetCoreTraceInstrumentationOptions) => AddAspNetCoreInstrumentation(builder, name: null, configureAspNetCoreTraceInstrumentationOptions);
+
+    public static TracerProviderBuilder AddAspNetCoreInstrumentation(this TracerProviderBuilder builder, string? name, Action<AspNetCoreTraceInstrumentationOptions>? configureAspNetCoreTraceInstrumentationOptions)  // <-------------------ote3.0
+    {
+
+        // note: Warm-up the status code and method mapping.
+        _ = TelemetryHelper.BoxedStatusCodes;
+        _ = TelemetryHelper.RequestDataHelper;
+
+        name ??= Options.DefaultName;
+
+        builder.ConfigureServices(services =>   // <---------------------------ote3.1
+        {
+            if (configureAspNetCoreTraceInstrumentationOptions != null)
+                services.Configure(name, configureAspNetCoreTraceInstrumentationOptions);
+
+            services.RegisterOptionsFactory(configuration => new AspNetCoreTraceInstrumentationOptions(configuration));
+        });
+
+        if (builder is IDeferredTracerProviderBuilder deferredTracerProviderBuilder)
+        {
+            deferredTracerProviderBuilder.Configure((sp, builder) =>
+            {
+                AddAspNetCoreInstrumentationSources(builder, name, sp);
+            });
+        }
+
+        return builder.AddInstrumentation(sp =>  // <---------------------------ote3.2.
+        {
+            var options = sp.GetRequiredService<IOptionsMonitor<AspNetCoreTraceInstrumentationOptions>>().Get(name);
+
+            return new AspNetCoreInstrumentation(new HttpInListener(options));
+        });
+    }
+
+    // note: This is used by unit tests.
+    internal static TracerProviderBuilder AddAspNetCoreInstrumentation(this TracerProviderBuilder builder, HttpInListener listener, string? optionsName = null)
+    {
+        optionsName ??= Options.DefaultName;
+
+        builder.AddAspNetCoreInstrumentationSources(optionsName);
+
+        return builder.AddInstrumentation(new AspNetCoreInstrumentation(listener));
+    }
+
+    private static void AddAspNetCoreInstrumentationSources(this TracerProviderBuilder builder, string optionsName, IServiceProvider? serviceProvider = null)
+    {
+        // for .NET7.0 onwards activity will be created using activitySource, for .NET6.0 and below, we will continue to use legacy way.
+        if (HttpInListener.Net7OrGreater)
+        {
+            // TODO: Check with .NET team to see if this can be prevented
+            // as this allows user to override the ActivitySource.
+            var activitySourceService = serviceProvider?.GetService<ActivitySource>();
+            if (activitySourceService != null)
+                builder.AddSource(activitySourceService.Name);
+            else        
+                builder.AddSource(HttpInListener.AspNetCoreActivitySourceName);   // for users not using hosting package?      
+        }
+        else
+        {
+            builder.AddSource(HttpInListener.ActivitySourceName);
+            builder.AddLegacySource(HttpInListener.ActivityOperationName); // for the activities created by AspNetCore
+        }
+        // ...
+    }
+}
+//--------------------------------------------------------------------------Ʌ
+
 //--------------------------------------------------------------------------V
 public static class HttpClientInstrumentationTracerProviderBuilderExtensions
 {
@@ -501,7 +1056,7 @@ public static class HttpClientInstrumentationTracerProviderBuilderExtensions
     {
         if (HttpHandlerDiagnosticListener.IsNet7OrGreater)
         {
-            builder.AddSource("System.Net.Http");  // <----------------------------! // hci0
+            builder.AddSource("System.Net.Http");  // <----------------------------------! hci0
         }
         else
         {
@@ -571,13 +1126,606 @@ public class HttpClientTraceInstrumentationOptions
 }
 //------------------------------------------------Ʌ
 
+//---------------------------------------------V
+internal sealed class HttpClientInstrumentation : IDisposable
+{
+    private static readonly HashSet<string> ExcludedDiagnosticSourceEventsNet7OrGreater =
+    [
+        "System.Net.Http.Request",
+        "System.Net.Http.Response",
+        "System.Net.Http.HttpRequestOut"
+    ];
+
+    private static readonly HashSet<string> ExcludedDiagnosticSourceEvents =
+    [
+        "System.Net.Http.Request",
+        "System.Net.Http.Response"
+    ];
+
+    private readonly DiagnosticSourceSubscriber diagnosticSourceSubscriber;
+
+    private readonly Func<string, object?, object?, bool> isEnabled = (eventName, _, _)
+        => !ExcludedDiagnosticSourceEvents.Contains(eventName);
+
+    private readonly Func<string, object?, object?, bool> isEnabledNet7OrGreater = (eventName, _, _)
+        => !ExcludedDiagnosticSourceEventsNet7OrGreater.Contains(eventName);
+
+    public HttpClientInstrumentation(HttpClientTraceInstrumentationOptions options)
+    {
+        this.diagnosticSourceSubscriber = HttpHandlerDiagnosticListener.IsNet7OrGreater
+                ? new DiagnosticSourceSubscriber(new HttpHandlerDiagnosticListener(options), this.isEnabledNet7OrGreater, HttpInstrumentationEventSource.Log.UnknownErrorProcessingEvent)
+                : new DiagnosticSourceSubscriber(new HttpHandlerDiagnosticListener(options), this.isEnabled, HttpInstrumentationEventSource.Log.UnknownErrorProcessingEvent);
+
+        this.diagnosticSourceSubscriber.Subscribe();
+    }
+
+    public void Dispose()
+    {
+        this.diagnosticSourceSubscriber?.Dispose();
+    }
+}
+//---------------------------------------------Ʌ
+
+//---------------------------------------------V
+internal sealed class AspNetCoreInstrumentation : IDisposable
+{
+    private static readonly HashSet<string> DiagnosticSourceEvents =
+    [
+        "Microsoft.AspNetCore.Hosting.HttpRequestIn",
+        "Microsoft.AspNetCore.Hosting.HttpRequestIn.Start",
+        "Microsoft.AspNetCore.Hosting.HttpRequestIn.Stop",
+        "Microsoft.AspNetCore.Diagnostics.UnhandledException",
+        "Microsoft.AspNetCore.Hosting.UnhandledException"
+    ];
+
+    private readonly Func<string, object?, object?, bool> isEnabled = (eventName, _, _) => DiagnosticSourceEvents.Contains(eventName);
+
+    private readonly DiagnosticSourceSubscriber diagnosticSourceSubscriber;
+
+    public AspNetCoreInstrumentation(HttpInListener httpInListener)
+    {
+        this.diagnosticSourceSubscriber = new DiagnosticSourceSubscriber(httpInListener, this.isEnabled, AspNetCoreInstrumentationEventSource.Log.UnknownErrorProcessingEvent);
+        this.diagnosticSourceSubscriber.Subscribe();
+    }
+
+    public void Dispose()
+    {
+        this.diagnosticSourceSubscriber?.Dispose();
+    }
+}
+//---------------------------------------------Ʌ
+
+//-------------------------------------------------V
+internal sealed class HttpHandlerDiagnosticListener : ListenerHandler
+{
+    internal const string HttpClientActivitySourceName = "System.Net.Http";
+    internal static readonly AssemblyName AssemblyName = typeof(HttpHandlerDiagnosticListener).Assembly.GetName();
+    internal static readonly bool IsNet7OrGreater = Environment.Version.Major >= 7;
+    internal static readonly bool IsNet9OrGreater = Environment.Version.Major >= 9;
+
+    internal static readonly string ActivitySourceName = AssemblyName.Name + ".HttpClient";
+    internal static readonly Version Version = AssemblyName.Version!;
+    internal static readonly ActivitySource ActivitySource = new(ActivitySourceName, Version.ToString());
+
+    private const string OnStartEvent = "System.Net.Http.HttpRequestOut.Start";
+    private const string OnStopEvent = "System.Net.Http.HttpRequestOut.Stop";
+    private const string OnUnhandledExceptionEvent = "System.Net.Http.Exception";
+
+    private static readonly PropertyFetcher<HttpRequestMessage> StartRequestFetcher = new("Request");
+    private static readonly PropertyFetcher<HttpResponseMessage> StopResponseFetcher = new("Response");
+    private static readonly PropertyFetcher<Exception> StopExceptionFetcher = new("Exception");
+    private static readonly PropertyFetcher<TaskStatus> StopRequestStatusFetcher = new("RequestTaskStatus");
+
+    private readonly HttpClientTraceInstrumentationOptions options;
+
+    public HttpHandlerDiagnosticListener(HttpClientTraceInstrumentationOptions options)
+        : base("HttpHandlerDiagnosticListener")
+    {
+        this.options = options;
+    }
+
+    public override void OnEventWritten(string name, object? payload)
+    {
+        var activity = Activity.Current!;
+        switch (name)
+        {
+            case OnStartEvent:
+                {
+                    this.OnStartActivity(activity, payload);
+                }
+
+                break;
+            case OnStopEvent:
+                {
+                    this.OnStopActivity(activity, payload);
+                }
+
+                break;
+            case OnUnhandledExceptionEvent:
+                {
+                    this.OnException(activity, payload);
+                }
+
+                break;
+            default:
+                break;
+        }
+    }
+
+    public void OnStartActivity(Activity activity, object? payload)
+    {
+        if (!TryFetchRequest(payload, out var request))
+        {
+            HttpInstrumentationEventSource.Log.NullPayload(nameof(HttpHandlerDiagnosticListener), nameof(this.OnStartActivity));
+            return;
+        }
+
+        // Propagate context irrespective of sampling decision
+        var textMapPropagator = Propagators.DefaultTextMapPropagator;
+        if (textMapPropagator is not TraceContextPropagator)
+        {
+            textMapPropagator.Inject(new PropagationContext(activity.Context, Baggage.Current), request, HttpRequestMessageContextPropagation.HeaderValueSetter);
+        }
+
+        if (IsNet7OrGreater && string.IsNullOrEmpty(activity.Source.Name))
+        {
+            activity.IsAllDataRequested = false;
+        }
+
+        if (activity.IsAllDataRequested)
+        {
+            try
+            {
+                if (!this.options.EventFilterHttpRequestMessage(activity.OperationName, request))
+                {
+                    HttpInstrumentationEventSource.Log.RequestIsFilteredOut(activity.OperationName);
+                    activity.IsAllDataRequested = false;
+                    activity.ActivityTraceFlags &= ~ActivityTraceFlags.Recorded;
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                HttpInstrumentationEventSource.Log.RequestFilterException(ex);
+                activity.IsAllDataRequested = false;
+                activity.ActivityTraceFlags &= ~ActivityTraceFlags.Recorded;
+                return;
+            }
+
+            HttpTagHelper.RequestDataHelper.SetActivityDisplayName(activity, request.Method.Method);
+
+            if (!IsNet7OrGreater)
+            {
+                ActivityInstrumentationHelper.SetActivitySourceProperty(activity, ActivitySource);
+                ActivityInstrumentationHelper.SetKindProperty(activity, ActivityKind.Client);
+            }
+
+            if (!IsNet9OrGreater)
+            {
+                HttpTagHelper.RequestDataHelper.SetHttpMethodTag(activity, request.Method.Method);
+
+                if (request.RequestUri != null)
+                {
+                    activity.SetTag(SemanticConventions.AttributeServerAddress, request.RequestUri.Host);
+                    activity.SetTag(SemanticConventions.AttributeServerPort, request.RequestUri.Port);
+                    activity.SetTag(SemanticConventions.AttributeUrlFull, HttpTagHelper.GetUriTagValueFromRequestUri(request.RequestUri, this.options.DisableUrlQueryRedaction));
+                }
+            }
+
+            try
+            {
+                this.options.EnrichWithHttpRequestMessage?.Invoke(activity, request);
+            }
+            catch (Exception ex)
+            {
+                HttpInstrumentationEventSource.Log.EnrichmentException(ex);
+            }
+        }
+
+        static bool TryFetchRequest(object? payload, [NotNullWhen(true)] out HttpRequestMessage? request)
+        {
+            return StartRequestFetcher.TryFetch(payload, out request) && request != null;
+        }
+    }
+
+    public void OnStopActivity(Activity activity, object? payload)
+    {
+        if (activity.IsAllDataRequested)
+        {
+            var requestTaskStatus = GetRequestStatus(payload);
+
+            var currentStatusCode = activity.Status;
+            if (requestTaskStatus != TaskStatus.RanToCompletion)
+            {
+                if (requestTaskStatus == TaskStatus.Canceled)
+                {
+                    if (currentStatusCode == ActivityStatusCode.Unset)
+                    {                   
+                        activity.SetStatus(ActivityStatusCode.Error, "Task Canceled");
+                        activity.SetTag(SemanticConventions.AttributeErrorType, typeof(TaskCanceledException).FullName);
+                    }
+                }
+                else if (requestTaskStatus != TaskStatus.Faulted)
+                {
+                    if (currentStatusCode == ActivityStatusCode.Unset)
+                    {
+                        // Faults are handled in OnException and should already have a span.Status of Error w/ Description.
+                        activity.SetStatus(ActivityStatusCode.Error);
+                    }
+                }
+            }
+
+            if (TryFetchResponse(payload, out var response))
+            {
+                if (!IsNet9OrGreater)
+                {
+                    if (currentStatusCode == ActivityStatusCode.Unset)
+                    {
+                        activity.SetStatus(SpanHelper.ResolveActivityStatusForHttpStatusCode(activity.Kind, (int)response.StatusCode));
+                    }
+
+                    activity.SetTag(SemanticConventions.AttributeNetworkProtocolVersion, RequestDataHelper.GetHttpProtocolVersion(response.Version));
+                    activity.SetTag(SemanticConventions.AttributeHttpResponseStatusCode, TelemetryHelper.GetBoxedStatusCode(response.StatusCode));
+                    if (activity.Status == ActivityStatusCode.Error)
+                    {
+                        activity.SetTag(SemanticConventions.AttributeErrorType, TelemetryHelper.GetStatusCodeString(response.StatusCode));
+                    }
+                }
+
+                try
+                {
+                    this.options.EnrichWithHttpResponseMessage?.Invoke(activity, response);
+                }
+                catch (Exception ex)
+                {
+                    HttpInstrumentationEventSource.Log.EnrichmentException(ex);
+                }
+            }
+
+            static TaskStatus GetRequestStatus(object? payload)
+            {
+                _ = StopRequestStatusFetcher.TryFetch(payload, out var requestTaskStatus);
+
+                return requestTaskStatus;
+            }
+        }
+
+        static bool TryFetchResponse(object? payload, [NotNullWhen(true)] out HttpResponseMessage? response)
+        {
+            return StopResponseFetcher.TryFetch(payload, out response) && response != null;
+        }
+    }
+
+    public void OnException(Activity activity, object? payload) { ... }
+    private static string? GetErrorType(Exception exc) { ... }
+}
+//-------------------------------------------------Ʌ
+
+//---------------------------V
+internal class HttpInListener : ListenerHandler
+{
+    internal const string ActivityOperationName = "Microsoft.AspNetCore.Hosting.HttpRequestIn";
+    internal const string OnStartEvent = "Microsoft.AspNetCore.Hosting.HttpRequestIn.Start";
+    internal const string OnStopEvent = "Microsoft.AspNetCore.Hosting.HttpRequestIn.Stop";
+    internal const string OnUnhandledHostingExceptionEvent = "Microsoft.AspNetCore.Hosting.UnhandledException";
+    internal const string OnUnHandledDiagnosticsExceptionEvent = "Microsoft.AspNetCore.Diagnostics.UnhandledException";
+
+    // https://github.com/dotnet/aspnetcore/blob/8d6554e655b64da75b71e0e20d6db54a3ba8d2fb/src/Hosting/Hosting/src/GenericHost/GenericWebHostBuilder.cs#L85
+    internal const string AspNetCoreActivitySourceName = "Microsoft.AspNetCore";
+
+    internal static readonly AssemblyName AssemblyName = typeof(HttpInListener).Assembly.GetName();
+    internal static readonly string ActivitySourceName = AssemblyName.Name!;
+    internal static readonly Version Version = AssemblyName.Version!;
+    internal static readonly ActivitySource ActivitySource = new(ActivitySourceName, Version.ToString());
+    internal static readonly bool Net7OrGreater = Environment.Version.Major >= 7;
+
+    private const string DiagnosticSourceName = "Microsoft.AspNetCore";
+
+    private static readonly Func<HttpRequest, string, IEnumerable<string>> HttpRequestHeaderValuesGetter = (request, name) =>
+    {
+        if (request.Headers.TryGetValue(name, out var value))
+        {
+            // This causes allocation as the `StringValues` struct has to be casted to an `IEnumerable<string>` object.
+            return value;
+        }
+
+        return [];
+    };
+
+    private static readonly PropertyFetcher<Exception> ExceptionPropertyFetcher = new("Exception");
+
+    private readonly AspNetCoreTraceInstrumentationOptions options;
+
+    public HttpInListener(AspNetCoreTraceInstrumentationOptions options) : base(DiagnosticSourceName)
+    {
+        this.options = options;
+    }
+
+    public override void OnEventWritten(string name, object? payload)
+    {
+        var activity = Activity.Current!;
+
+        switch (name)
+        {
+            case OnStartEvent:
+                {
+                    this.OnStartActivity(activity, payload);
+                }
+
+                break;
+            case OnStopEvent:
+                {
+                    this.OnStopActivity(activity, payload);
+                }
+
+                break;
+            case OnUnhandledHostingExceptionEvent:
+            case OnUnHandledDiagnosticsExceptionEvent:
+                {
+                    this.OnException(activity, payload);
+                }
+
+                break;
+            default:
+                break;
+        }
+    }
+
+    public void OnStartActivity(Activity activity, object? payload)
+    {
+        // The overall flow of what AspNetCore library does is as below:
+        // Activity.Start()
+        // DiagnosticSource.WriteEvent("Start", payload)
+        // DiagnosticSource.WriteEvent("Stop", payload)
+        // Activity.Stop()
+
+        // This method is in the WriteEvent("Start", payload) path.
+        // By this time, samplers have already run and
+        // activity.IsAllDataRequested populated accordingly.
+
+        if (payload is not HttpContext context)
+        {
+            AspNetCoreInstrumentationEventSource.Log.NullPayload(nameof(HttpInListener), nameof(this.OnStartActivity), activity.OperationName);
+            return;
+        }
+
+        // Ensure context extraction irrespective of sampling decision
+        var request = context.Request;
+        var textMapPropagator = Propagators.DefaultTextMapPropagator;
+        if (textMapPropagator is not TraceContextPropagator)
+        {
+            var ctx = textMapPropagator.Extract(default, request, HttpRequestHeaderValuesGetter);
+            if (ctx.ActivityContext.IsValid() && !((ctx.ActivityContext.TraceId == activity.TraceId) && (ctx.ActivityContext.SpanId == activity.ParentSpanId) && (ctx.ActivityContext.TraceState == activity.TraceStateString)))
+            {
+                // Create a new activity with its parent set from the extracted context.
+                // This makes the new activity as a "sibling" of the activity created by
+                // Asp.Net Core.
+                Activity? newOne;
+                if (Net7OrGreater)
+                {
+                    // For NET7.0 onwards activity is created using ActivitySource so,
+                    // we will use the source of the activity to create the new one.
+                    newOne = activity.Source.CreateActivity(ActivityOperationName, ActivityKind.Server, ctx.ActivityContext);
+                }
+                else
+                {
+                    newOne = new Activity(ActivityOperationName);
+                    newOne.SetParentId(ctx.ActivityContext.TraceId, ctx.ActivityContext.SpanId, ctx.ActivityContext.TraceFlags);
+                }
+
+                newOne!.TraceStateString = ctx.ActivityContext.TraceState;
+
+                newOne.SetTag("IsCreatedByInstrumentation", bool.TrueString);
+
+                // Starting the new activity make it the Activity.Current one.
+                newOne.Start();
+
+                // Set IsAllDataRequested to false for the activity created by the framework to only export the sibling activity and not the framework activity
+                activity.IsAllDataRequested = false;
+                activity = newOne;
+            }
+
+            Baggage.Current = ctx.Baggage;
+        }
+
+        // enrich Activity from payload only if sampling decision is favorable.
+        if (activity.IsAllDataRequested)
+        {
+            try
+            {
+                if (this.options.Filter?.Invoke(context) == false)
+                {
+                    AspNetCoreInstrumentationEventSource.Log.RequestIsFilteredOut(nameof(HttpInListener), nameof(this.OnStartActivity), activity.OperationName);
+                    activity.IsAllDataRequested = false;
+                    activity.ActivityTraceFlags &= ~ActivityTraceFlags.Recorded;
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                AspNetCoreInstrumentationEventSource.Log.RequestFilterException(nameof(HttpInListener), nameof(this.OnStartActivity), activity.OperationName, ex);
+                activity.IsAllDataRequested = false;
+                activity.ActivityTraceFlags &= ~ActivityTraceFlags.Recorded;
+                return;
+            }
+
+            if (!Net7OrGreater)
+            {
+                ActivityInstrumentationHelper.SetActivitySourceProperty(activity, ActivitySource);
+                ActivityInstrumentationHelper.SetKindProperty(activity, ActivityKind.Server);
+            }
+
+            var path = (request.PathBase.HasValue || request.Path.HasValue) ? (request.PathBase + request.Path).ToString() : "/";
+            TelemetryHelper.RequestDataHelper.SetActivityDisplayName(activity, request.Method);
+
+            if (request.Host.HasValue)
+            {
+                activity.SetTag(SemanticConventions.AttributeServerAddress, request.Host.Host);
+
+                if (request.Host.Port.HasValue)
+                    activity.SetTag(SemanticConventions.AttributeServerPort, request.Host.Port.Value);
+            }
+
+            if (request.QueryString.HasValue)
+            {
+                if (this.options.DisableUrlQueryRedaction)
+                    activity.SetTag(SemanticConventions.AttributeUrlQuery, request.QueryString.Value);
+                else
+                    activity.SetTag(SemanticConventions.AttributeUrlQuery, RedactionHelper.GetRedactedQueryString(request.QueryString.Value!));
+            }
+
+            TelemetryHelper.RequestDataHelper.SetHttpMethodTag(activity, request.Method);
+
+            activity.SetTag(SemanticConventions.AttributeUrlScheme, request.Scheme);
+            activity.SetTag(SemanticConventions.AttributeUrlPath, path);
+            activity.SetTag(SemanticConventions.AttributeNetworkProtocolVersion, RequestDataHelper.GetHttpProtocolVersion(request.Protocol));
+
+            if (request.Headers.TryGetValue("User-Agent", out var values))
+            {
+                var userAgent = values.Count > 0 ? values[0] : null;
+                if (!string.IsNullOrEmpty(userAgent))
+                {
+                    activity.SetTag(SemanticConventions.AttributeUserAgentOriginal, userAgent);
+                }
+            }
+
+            try
+            {
+                this.options.EnrichWithHttpRequest?.Invoke(activity, request);
+            }
+            catch (Exception ex)
+            {
+                AspNetCoreInstrumentationEventSource.Log.EnrichmentException(nameof(HttpInListener), nameof(this.OnStartActivity), activity.OperationName, ex);
+            }
+        }
+    }
+
+    public void OnStopActivity(Activity activity, object? payload)
+    {
+        if (activity.IsAllDataRequested)
+        {
+            if (payload is not HttpContext context)
+            {
+                AspNetCoreInstrumentationEventSource.Log.NullPayload(nameof(HttpInListener), nameof(this.OnStopActivity), activity.OperationName);
+                return;
+            }
+
+            var response = context.Response;
+
+            var routePattern = (context.Features.Get<IExceptionHandlerPathFeature>()?.Endpoint as RouteEndpoint ?? context.GetEndpoint() as RouteEndpoint)?.RoutePattern.RawText;
+            if (!string.IsNullOrEmpty(routePattern))
+            {
+                TelemetryHelper.RequestDataHelper.SetActivityDisplayName(activity, context.Request.Method, routePattern);
+                activity.SetTag(SemanticConventions.AttributeHttpRoute, routePattern);
+            }
+
+            activity.SetTag(SemanticConventions.AttributeHttpResponseStatusCode, TelemetryHelper.GetBoxedStatusCode(response.StatusCode));
+
+            if (this.options.EnableGrpcAspNetCoreSupport && TryGetGrpcMethod(activity, out var grpcMethod))
+                AddGrpcAttributes(activity, grpcMethod, context);
+
+            if (activity.Status == ActivityStatusCode.Unset)
+                activity.SetStatus(SpanHelper.ResolveActivityStatusForHttpStatusCode(activity.Kind, response.StatusCode));
+
+            try
+            {
+                this.options.EnrichWithHttpResponse?.Invoke(activity, response);
+            }
+            catch (Exception ex)
+            {
+                AspNetCoreInstrumentationEventSource.Log.EnrichmentException(nameof(HttpInListener), nameof(this.OnStopActivity), activity.OperationName, ex);
+            }
+        }
+
+        object? tagValue;
+        if (Net7OrGreater)
+            tagValue = activity.GetTagValue("IsCreatedByInstrumentation");
+        else
+            _ = activity.TryCheckFirstTag("IsCreatedByInstrumentation", out tagValue);
+
+        if (ReferenceEquals(tagValue, bool.TrueString))
+        {
+            activity.SetTag("IsCreatedByInstrumentation", null);
+            activity.Stop();
+        }
+    }
+
+    public void OnException(Activity activity, object? payload)
+    {
+        if (activity.IsAllDataRequested)
+        {
+            // we need to use reflection here as the payload type is not a defined public type.
+            if (!TryFetchException(payload, out var exc))
+            {
+                AspNetCoreInstrumentationEventSource.Log.NullPayload(nameof(HttpInListener), nameof(this.OnException), activity.OperationName);
+                return;
+            }
+
+            activity.SetTag(SemanticConventions.AttributeErrorType, exc.GetType().FullName);
+
+            if (this.options.RecordException)
+                activity.AddException(exc);
+
+            activity.SetStatus(ActivityStatusCode.Error);
+
+            try
+            {
+                this.options.EnrichWithException?.Invoke(activity, exc);
+            }
+            catch (Exception ex)
+            {
+                AspNetCoreInstrumentationEventSource.Log.EnrichmentException(nameof(HttpInListener), nameof(this.OnException), activity.OperationName, ex);
+            }
+        }
+    }
+
+    private static bool TryGetGrpcMethod(Activity activity, [NotNullWhen(true)] out string? grpcMethod)
+    {
+        grpcMethod = GrpcTagHelper.GetGrpcMethodFromActivity(activity);
+        return !string.IsNullOrEmpty(grpcMethod);
+    }
+
+    private static void AddGrpcAttributes(Activity activity, string grpcMethod, HttpContext context)
+    {
+        activity.DisplayName = grpcMethod.TrimStart('/');
+
+        activity.SetTag(SemanticConventions.AttributeRpcSystem, GrpcTagHelper.RpcSystemGrpc);
+
+        if (context.Connection.RemoteIpAddress != null)
+            activity.SetTag(SemanticConventions.AttributeClientAddress, context.Connection.RemoteIpAddress.ToString());
+
+        activity.SetTag(SemanticConventions.AttributeClientPort, context.Connection.RemotePort);
+
+        var validConversion = GrpcTagHelper.TryGetGrpcStatusCodeFromActivity(activity, out var status);
+        if (validConversion)
+            activity.SetStatus(GrpcTagHelper.ResolveSpanStatusForGrpcStatusCode(status));
+
+        if (GrpcTagHelper.TryParseRpcServiceAndRpcMethod(grpcMethod, out var rpcService, out var rpcMethod))
+        {
+            activity.SetTag(SemanticConventions.AttributeRpcService, rpcService);
+            activity.SetTag(SemanticConventions.AttributeRpcMethod, rpcMethod);
+
+            // Remove the grpc.method tag added by the gRPC .NET library
+            activity.SetTag(GrpcTagHelper.GrpcMethodTagName, null);
+
+            // Remove the grpc.status_code tag added by the gRPC .NET library
+            activity.SetTag(GrpcTagHelper.GrpcStatusCodeTagName, null);
+
+            if (validConversion)
+            {
+                // setting rpc.grpc.status_code
+                activity.SetTag(SemanticConventions.AttributeRpcGrpcStatusCode, status);
+            }
+        }
+    }
+}
+//---------------------------Ʌ
+
 //--------------------------------------V
 public sealed class OpenTelemetryBuilder : IOpenTelemetryBuilder
 {
     internal OpenTelemetryBuilder(IServiceCollection services)
     {
-        Guard.ThrowIfNull(services);
-
         services.AddOpenTelemetrySharedProviderBuilderServices();
 
         this.Services = services;
@@ -604,7 +1752,7 @@ public sealed class OpenTelemetryBuilder : IOpenTelemetryBuilder
 
     public OpenTelemetryBuilder WithTracing(Action<TracerProviderBuilder> configure)
     {
-        OpenTelemetryBuilderSdkExtensions.WithTracing(this, configure);
+        OpenTelemetryBuilderSdkExtensions.WithTracing(this, configure);  // <------------------------ote2.0
         return this;
     }
 
@@ -646,20 +1794,18 @@ public static class OpenTelemetryBuilderSdkExtensions
         return builder;
     }
 
-    public static IOpenTelemetryBuilder WithTracing(this IOpenTelemetryBuilder builder)
-        => WithTracing(builder, b => { });
+    public static IOpenTelemetryBuilder WithTracing(this IOpenTelemetryBuilder builder) => WithTracing(builder, b => { });
 
-    public static IOpenTelemetryBuilder WithTracing(this IOpenTelemetryBuilder builder, Action<TracerProviderBuilder> configure)
+    public static IOpenTelemetryBuilder WithTracing(this IOpenTelemetryBuilder builder, Action<TracerProviderBuilder> configure) // <----------ote2.0
     {
-        var tracerProviderBuilder = new TracerProviderBuilderBase(builder.Services);
+        var tracerProviderBuilder = new TracerProviderBuilderBase(builder.Services);   // <-------------------ote2.1
 
-        configure(tracerProviderBuilder);
+        configure(tracerProviderBuilder);  // <-------------------ote2.2.
 
         return builder;
     }
 
-    public static IOpenTelemetryBuilder WithLogging(this IOpenTelemetryBuilder builder)
-        => WithLogging(builder, configureBuilder: null, configureOptions: null);
+    public static IOpenTelemetryBuilder WithLogging(this IOpenTelemetryBuilder builder)  => WithLogging(builder, configureBuilder: null, configureOptions: null);
 
     public static IOpenTelemetryBuilder WithLogging(this IOpenTelemetryBuilder builder, Action<LoggerProviderBuilder> configure)
     {
@@ -674,6 +1820,80 @@ public static class OpenTelemetryBuilderSdkExtensions
     }
 }
 //---------------------------------------------------Ʌ
+
+//----------------------------------------------------------V
+internal sealed class TracerProviderServiceCollectionBuilder : TracerProviderBuilder, ITracerProviderBuilder
+{
+    public TracerProviderServiceCollectionBuilder(IServiceCollection services)
+    {
+        services.ConfigureOpenTelemetryTracerProvider((sp, builder) => this.Services = null);
+
+        this.Services = services;
+    }
+
+    public IServiceCollection? Services { get; set; }
+
+    public TracerProvider? Provider => null;
+
+    public override TracerProviderBuilder AddInstrumentation<TInstrumentation>(Func<TInstrumentation> instrumentationFactory)  // <----------------ote4.2
+    {
+        this.ConfigureBuilderInternal((sp, builder) =>
+        {
+            builder.AddInstrumentation(instrumentationFactory);
+        });
+
+        return this;
+    }
+
+    public override TracerProviderBuilder AddSource(params string[] names)
+    {
+        this.ConfigureBuilderInternal((sp, builder) =>
+        {
+            builder.AddSource(names);
+        });
+
+        return this;
+    }
+
+    public override TracerProviderBuilder AddLegacySource(string operationName)
+    {
+        this.ConfigureBuilderInternal((sp, builder) =>
+        {
+            builder.AddLegacySource(operationName);
+        });
+
+        return this;
+    }
+
+    public TracerProviderBuilder ConfigureServices(Action<IServiceCollection> configure)
+        => this.ConfigureServicesInternal(configure);
+
+    public TracerProviderBuilder ConfigureBuilder(Action<IServiceProvider, TracerProviderBuilder> configure)
+        => this.ConfigureBuilderInternal(configure);
+
+    TracerProviderBuilder IDeferredTracerProviderBuilder.Configure(Action<IServiceProvider, TracerProviderBuilder> configure)
+        => this.ConfigureBuilderInternal(configure);
+
+    private TracerProviderServiceCollectionBuilder ConfigureBuilderInternal(Action<IServiceProvider, TracerProviderBuilder> configure)  // <--------------------ote4.3
+    {
+        var services = this.Services ?? throw new NotSupportedException("Builder cannot be configured during TracerProvider construction.");
+
+        services.ConfigureOpenTelemetryTracerProvider(configure);  // <----------------------------------ote4.4, configure is
+                                                                   //  (sp, builder) => builder.AddInstrumentation(sp => new AspNetCoreInstrumentation(new HttpInListener(options)))
+        return this;
+    }
+
+    private TracerProviderServiceCollectionBuilder ConfigureServicesInternal(Action<IServiceCollection> configure)
+    {
+        var services = this.Services
+            ?? throw new NotSupportedException("Services cannot be configured during TracerProvider construction.");
+
+        configure(services);
+
+        return this;
+    }
+}
+//----------------------------------------------------------Ʌ
 
 //------------------------------------V
 public class TracerProviderBuilderBase : TracerProviderBuilder, ITracerProviderBuilder
@@ -696,7 +1916,7 @@ public class TracerProviderBuilderBase : TracerProviderBuilder, ITracerProviderB
         this.allowBuild = true;
     }
 
-    internal TracerProviderBuilderBase(IServiceCollection services)
+    internal TracerProviderBuilderBase(IServiceCollection services)   // <----------------------
     {
         services
             .AddOpenTelemetryTracerProviderBuilderServices()
@@ -709,9 +1929,9 @@ public class TracerProviderBuilderBase : TracerProviderBuilder, ITracerProviderB
 
     TracerProvider? ITracerProviderBuilder.Provider => null;
 
-    public override TracerProviderBuilder AddInstrumentation<TInstrumentation>(Func<TInstrumentation> instrumentationFactory)
+    public override TracerProviderBuilder AddInstrumentation<TInstrumentation>(Func<TInstrumentation> instrumentationFactory)  // <---------------------------ote4.0
     {
-        this.innerBuilder.AddInstrumentation(instrumentationFactory);
+        this.innerBuilder.AddInstrumentation(instrumentationFactory);  // <-------ote4.1, instrumentationFactory is sp => new AspNetCoreInstrumentation(new HttpInListener(options))
 
         return this;
     }
@@ -819,7 +2039,7 @@ internal sealed class TracerProviderBuilderSdk : TracerProviderBuilder, ITracerP
         this.tracerProvider = tracerProvider;
     }
 
-    public override TracerProviderBuilder AddInstrumentation<TInstrumentation>(Func<TInstrumentation> instrumentationFactory)
+    public override TracerProviderBuilder AddInstrumentation<TInstrumentation>(Func<TInstrumentation> instrumentationFactory)  // <--------------------------ote4.8
     {
         return this.AddInstrumentation(
             typeof(TInstrumentation).Name,
@@ -829,7 +2049,7 @@ internal sealed class TracerProviderBuilderSdk : TracerProviderBuilder, ITracerP
 
     public TracerProviderBuilder AddInstrumentation(string instrumentationName, string instrumentationVersion, object? instrumentation)
     {
-        this.Instrumentation.Add(new InstrumentationRegistration(instrumentationName, instrumentationVersion, instrumentation));
+        this.Instrumentation.Add(new InstrumentationRegistration(instrumentationName, instrumentationVersion, instrumentation)); // <--------------------------ote4.9.
 
         return this;
     }
@@ -857,7 +2077,7 @@ internal sealed class TracerProviderBuilderSdk : TracerProviderBuilder, ITracerP
         return this;
     }
 
-    public override TracerProviderBuilder AddSource(params string[] names)
+    public override TracerProviderBuilder AddSource(params string[] names)  // <---------------------
     {
         foreach (var name in names!)
         {
@@ -867,9 +2087,9 @@ internal sealed class TracerProviderBuilderSdk : TracerProviderBuilder, ITracerP
         return this;
     }
 
-    public TracerProviderBuilder AddProcessor(BaseProcessor<Activity> processor)
+    public TracerProviderBuilder AddProcessor(BaseProcessor<Activity> processor)  // <---------------------------------coe1.1
     {
-        this.Processors.Add(processor!);
+        this.Processors.Add(processor!);   // <---------------------------------coe1.2  processor is new SimpleActivityExportProcessor(new ConsoleActivityExporter(options))
 
         return this;
     }
@@ -967,10 +2187,10 @@ internal sealed class TracerProviderSdk : TracerProvider
 
         OpenTelemetrySdkEventSource.Log.TracerProviderSdkEvent("Building TracerProvider.");
 
-        var configureProviderBuilders = serviceProvider!.GetServices<IConfigureTracerProviderBuilder>();
+        var configureProviderBuilders = serviceProvider!.GetServices<IConfigureTracerProviderBuilder>();   // <-----------------------------ote4.6
         foreach (var configureProviderBuilder in configureProviderBuilders)
         {
-            configureProviderBuilder.ConfigureBuilder(serviceProvider!, state);
+            configureProviderBuilder.ConfigureBuilder(serviceProvider!, state);  // <--------------------------ote4.7
         }
 
         StringBuilder processorsAdded = new StringBuilder();
@@ -1066,7 +2286,7 @@ internal sealed class TracerProviderSdk : TracerProvider
                     return;
 
                 if (SuppressInstrumentationScope.IncrementIfTriggered() == 0)
-                    this.processor?.OnStart(activity);
+                    this.processor?.OnStart(activity);   // <-----------------------------pro
             };
 
             activityListener.ActivityStopped = activity =>
@@ -1201,7 +2421,7 @@ internal sealed class TracerProviderSdk : TracerProvider
             });
             newCompositeProcessor.SetParentProvider(this);
             newCompositeProcessor.AddProcessor(processor);
-            this.processor = newCompositeProcessor;
+            this.processor = newCompositeProcessor;  // <----------------------------pro
         }
 
         return this;
@@ -1499,6 +2719,175 @@ public abstract class BaseProcessor<T> : IDisposable
     protected virtual void Dispose(bool disposing) { }
 }
 //------------------------------------Ʌ
+
+//--------------------------------V
+public class CompositeProcessor<T> : BaseProcessor<T>
+{
+    internal readonly DoublyLinkedListNode Head;
+    private DoublyLinkedListNode tail;
+    private bool disposed;
+
+    public CompositeProcessor(IEnumerable<BaseProcessor<T>> processors)
+    {
+        Guard.ThrowIfNull(processors);
+
+        using var iter = processors.GetEnumerator();
+        if (!iter.MoveNext())
+        {
+            throw new ArgumentException($"'{iter}' is null or empty", nameof(processors));
+        }
+
+        this.Head = new DoublyLinkedListNode(iter.Current);
+        this.tail = this.Head;
+
+        while (iter.MoveNext())
+        {
+            this.AddProcessor(iter.Current);
+        }
+    }
+
+    public CompositeProcessor<T> AddProcessor(BaseProcessor<T> processor)
+    {
+        Guard.ThrowIfNull(processor);
+
+        var node = new DoublyLinkedListNode(processor)
+        {
+            Previous = this.tail,
+        };
+        this.tail.Next = node;
+        this.tail = node;
+
+        return this;
+    }
+
+    public override void OnEnd(T data)
+    {
+        for (var cur = this.Head; cur != null; cur = cur.Next)
+        {
+            cur.Value.OnEnd(data);
+        }
+    }
+
+    public override void OnStart(T data)
+    {
+        for (var cur = this.Head; cur != null; cur = cur.Next)
+        {
+            cur.Value.OnStart(data);
+        }
+    }
+
+    internal override void SetParentProvider(BaseProvider parentProvider)
+    {
+        base.SetParentProvider(parentProvider);
+
+        for (var cur = this.Head; cur != null; cur = cur.Next)
+        {
+            cur.Value.SetParentProvider(parentProvider);
+        }
+    }
+
+    internal IReadOnlyList<BaseProcessor<T>> ToReadOnlyList()
+    {
+        var list = new List<BaseProcessor<T>>();
+
+        for (var cur = this.Head; cur != null; cur = cur.Next)
+        {
+            list.Add(cur.Value);
+        }
+
+        return list;
+    }
+
+    protected override bool OnForceFlush(int timeoutMilliseconds)
+    {
+        var result = true;
+        var sw = timeoutMilliseconds == Timeout.Infinite
+            ? null
+            : Stopwatch.StartNew();
+
+        for (var cur = this.Head; cur != null; cur = cur.Next)
+        {
+            if (sw == null)
+            {
+                result = cur.Value.ForceFlush() && result;
+            }
+            else
+            {
+                var timeout = timeoutMilliseconds - sw.ElapsedMilliseconds;
+
+                // notify all the processors, even if we run overtime
+                result = cur.Value.ForceFlush((int)Math.Max(timeout, 0)) && result;
+            }
+        }
+
+        return result;
+    }
+
+    protected override bool OnShutdown(int timeoutMilliseconds)
+    {
+        var result = true;
+        var sw = timeoutMilliseconds == Timeout.Infinite
+            ? null
+            : Stopwatch.StartNew();
+
+        for (var cur = this.Head; cur != null; cur = cur.Next)
+        {
+            if (sw == null)
+            {
+                result = cur.Value.Shutdown() && result;
+            }
+            else
+            {
+                var timeout = timeoutMilliseconds - sw.ElapsedMilliseconds;
+
+                // notify all the processors, even if we run overtime
+                result = cur.Value.Shutdown((int)Math.Max(timeout, 0)) && result;
+            }
+        }
+
+        return result;
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (!this.disposed)
+        {
+            if (disposing)
+            {
+                for (var cur = this.Head; cur != null; cur = cur.Next)
+                {
+                    try
+                    {
+                        cur.Value.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        OpenTelemetrySdkEventSource.Log.SpanProcessorException(nameof(this.Dispose), ex);
+                    }
+                }
+            }
+
+            this.disposed = true;
+        }
+
+        base.Dispose(disposing);
+    }
+
+    internal sealed class DoublyLinkedListNode
+    {
+        public readonly BaseProcessor<T> Value;
+
+        public DoublyLinkedListNode(BaseProcessor<T> value)
+        {
+            this.Value = value;
+        }
+
+        public DoublyLinkedListNode? Previous { get; set; }
+
+        public DoublyLinkedListNode? Next { get; set; }
+    }
+}
+//--------------------------------Ʌ
 
 //------------------------------------------V
 public abstract class BaseExportProcessor<T> : BaseProcessor<T> where T : class
@@ -2164,7 +3553,7 @@ internal sealed class HttpHandlerDiagnosticListener : ListenerHandler
 //-------------------------------------------------V
 public static class ConsoleExporterHelperExtensions
 {
-    public static TracerProviderBuilder AddConsoleExporter(this TracerProviderBuilder builder) => AddConsoleExporter(builder, name: null, configure: null);
+    public static TracerProviderBuilder AddConsoleExporter(this TracerProviderBuilder builder) => AddConsoleExporter(builder, name: null, configure: null);  // <--------coe0
 
     public static TracerProviderBuilder AddConsoleExporter(this TracerProviderBuilder builder, Action<ConsoleExporterOptions> configure)
         => AddConsoleExporter(builder, name: null, configure);
@@ -2176,7 +3565,7 @@ public static class ConsoleExporterHelperExtensions
         if (configure != null)
             builder.ConfigureServices(services => services.Configure(name, configure));
 
-        return builder.AddProcessor(sp =>
+        return builder.AddProcessor(sp =>   // <-----------------------------------------------------coe0.1.
         {
             var options = sp.GetRequiredService<IOptionsMonitor<ConsoleExporterOptions>>().Get(name);
 
