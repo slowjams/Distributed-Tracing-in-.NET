@@ -1,0 +1,130 @@
+version: '3.4'
+
+networks:
+  tracing:
+    name: tracing-network
+    
+services:
+  rabbitmq:
+    image: rabbitmq:3.13.1-management
+    ports:
+      - 15672:15672
+      - 5672
+    networks:
+      - tracing
+
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2019-GA-ubuntu-16.04
+    environment:
+      - ACCEPT_EULA=Y
+      - SA_PASSWORD=Pass@Word1
+    ports:
+      - 1433
+    networks:
+      - tracing
+
+  redis:
+    image: redis:7.2.4
+    ports:
+    - 6379:6379
+    networks:
+      - tracing
+    
+  jaeger:
+    image: jaegertracing/all-in-one:1.56.0
+    container_name: jaeger
+    restart: unless-stopped
+    ports:
+      - 5775:5775/udp
+      - 6831:6831/udp
+      - 6832:6832/udp
+      - 5778:5778
+      - 16686:16686
+      - 14250:14250
+      - 14268:14268
+      - 14269:14269
+      - 4317:4317
+      - 4318:4318
+      - 9411:9411
+    networks:
+      - tracing
+    environment:
+      COLLECTOR_OTLP_ENABLED: true
+
+  app1:
+    build:
+      context: ./App1.WebApi
+    ports:
+      - "5000:8080"
+    networks:
+      - tracing
+    depends_on: 
+      - rabbitmq
+      - jaeger
+      - app3
+    environment:
+      Jaeger__Protocol: http
+      Jaeger__Port: 4317
+      Jaeger__Host: jaeger
+      RabbitMq__Host: rabbitmq
+      App3Endpoint: http://app3:8080
+
+  app2:
+    stdin_open: true
+    tty: true
+    build:
+      context: ./App2.RabbitConsumer.Console
+    networks:
+      - tracing
+    depends_on: 
+      - rabbitmq
+      - jaeger
+      - app3
+    entrypoint: ["./wait.sh", "30", "dotnet", "App2.RabbitConsumer.Console.dll"]
+    environment:
+      Jaeger__Protocol: http
+      Jaeger__Port: 4317
+      Jaeger__Host: jaeger
+      RabbitMq__Host: rabbitmq
+      App3UriEndpoint: http://app3:8080
+
+
+  app3:
+    build:
+      context: ./App3.WebApi
+    ports:
+      - "5001:8080"
+    networks:
+      - tracing
+    depends_on: 
+      - rabbitmq
+      - jaeger
+      - sqlserver
+    environment:
+      Jaeger__Protocol: http
+      Jaeger__Port: 4317
+      Jaeger__Host: jaeger
+      RabbitMq__Host: rabbitmq
+      SqlDbConnString: server=sqlserver;user id=sa;password=Pass@Word1;
+  
+
+
+  app4:
+    build:
+      context: ./App4.RabbitConsumer.HostedService
+    networks:
+      - tracing
+    depends_on: 
+      - rabbitmq
+      - jaeger
+      - redis
+    entrypoint: ["./wait.sh", "30", "dotnet", "App4.RabbitConsumer.HostedService.dll"]
+    environment:
+      Jaeger__Protocol: http
+      Jaeger__Port: 4317
+      Jaeger__Host: jaeger
+      RabbitMq__Host: rabbitmq
+      Redis__Host: redis
+      Redis__Port: 6379
+
+  

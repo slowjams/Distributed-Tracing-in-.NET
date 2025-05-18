@@ -213,8 +213,8 @@ internal sealed class DiagnosticsHandler : HttpMessageHandlerStage
 
     private void InjectHeaders(Activity currentActivity, HttpRequestMessage request)
     {
-        _propagator.Inject(currentActivity, request, static (carrier, key, value) =>   // <----------------------dcp
-        {
+        _propagator.Inject(currentActivity, request, static (carrier, key, value) =>   // <---------------dcp, carrier is HttpRequestMessage
+        {                                                                              // key is "traceparent", value is activity.Id
             if (carrier is HttpRequestMessage request &&
                 key is not null &&
                 HeaderDescriptor.TryGet(key, out HeaderDescriptor descriptor) &&

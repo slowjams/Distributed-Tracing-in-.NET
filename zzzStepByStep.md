@@ -96,7 +96,7 @@ When  serviceB receives the HTTP request, `GenericWebHostService`'s `HostingAppl
  creates `new Activity("Microsoft.AspNetCore.Hosting.HttpRequestIn")` (let's call it `activityB1`), `activityB1`'s parent is set to be `activityA2` (refer to dlr) 
 
 
-=============================================================================================
+==================================================================================================================================================================
 
 
 ## Source Code `SimpleMicroservicesVerifyCausation` 

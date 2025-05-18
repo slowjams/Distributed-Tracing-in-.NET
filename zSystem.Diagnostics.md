@@ -867,6 +867,19 @@ internal sealed class W3CPropagator : DistributedContextPropagator
     private const int MaxBaggageEncodedLength = 8192;   // Suggested by W3C specs
     private const int MaxTraceStateEncodedLength = 256; // Suggested by W3C specs
 
+    internal const string TraceParent        = "traceparent";
+    internal const string RequestId          = "Request-Id";
+    internal const string TraceState         = "tracestate";
+    internal const string Baggage            = "baggage";
+    internal const string CorrelationContext = "Correlation-Context";
+    internal const char   Space              = ' ';
+    internal const char   Tab                = (char)9;
+    internal const char   Comma              = ',';
+    internal const char   Semicolon          = ';';
+    internal const string CommaWithSpace     = ", ";
+ 
+    internal static readonly char [] s_trimmingSpaceCharacters = new char[] { Space, Tab };
+
     private const char Equal = '=';
     private const char Percent = '%';
     private const char Replacement = '\uFFFD'; // �

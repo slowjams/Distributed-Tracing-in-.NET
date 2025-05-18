@@ -2670,6 +2670,306 @@ internal sealed class TracerProviderSdk : TracerProvider
 }
 //-------------------------------------Ʌ
 
+//--------------------------V
+public class ResourceBuilder
+{
+    internal readonly List<IResourceDetector> ResourceDetectors = [];
+    private static readonly Resource DefaultResource = PrepareDefaultResource();
+
+    private ResourceBuilder() { }
+
+    internal IServiceProvider? ServiceProvider { get; set; }
+
+    public static ResourceBuilder CreateDefault()
+        => new ResourceBuilder()
+            .AddResource(DefaultResource)
+            .AddTelemetrySdk()
+            .AddEnvironmentVariableDetector();
+
+    public static ResourceBuilder CreateEmpty() => new();
+
+    public ResourceBuilder Clear()
+    {
+        this.ResourceDetectors.Clear();
+
+        return this;
+    }
+
+    public Resource Build()
+    {
+        Resource finalResource = Resource.Empty;
+
+        foreach (IResourceDetector resourceDetector in this.ResourceDetectors)
+        {
+            if (resourceDetector is ResolvingResourceDetector resolvingResourceDetector)
+            {
+                resolvingResourceDetector.Resolve(this.ServiceProvider);
+            }
+
+            var resource = resourceDetector.Detect();
+            if (resource != null)
+            {
+                finalResource = finalResource.Merge(resource);
+            }
+        }
+
+        return finalResource;
+    }
+
+    public ResourceBuilder AddDetector(IResourceDetector resourceDetector)
+    {
+        this.ResourceDetectors.Add(resourceDetector);
+
+        return this;
+    }
+
+    public ResourceBuilder AddDetector(Func<IServiceProvider, IResourceDetector> resourceDetectorFactory)
+    {
+        return this.AddDetectorInternal(sp =>
+        {
+            if (sp == null)
+                throw new NotSupportedException("IResourceDetector factory pattern is not supported when calling ResourceBuilder.Build() directly.");
+
+            return resourceDetectorFactory(sp);
+        });
+    }
+
+    internal ResourceBuilder AddDetectorInternal(Func<IServiceProvider?, IResourceDetector> resourceDetectorFactory)
+    {
+        this.ResourceDetectors.Add(new ResolvingResourceDetector(resourceDetectorFactory));
+
+        return this;
+    }
+
+    internal ResourceBuilder AddResource(Resource resource)
+    {
+        this.ResourceDetectors.Add(new WrapperResourceDetector(resource));
+
+        return this;
+    }
+
+    private static Resource PrepareDefaultResource()
+    {
+        var defaultServiceName = "unknown_service";
+
+        try
+        {
+            var processName = Process.GetCurrentProcess().ProcessName;
+            if (!string.IsNullOrWhiteSpace(processName))
+            {
+                defaultServiceName = $"{defaultServiceName}:{processName}";
+            }
+        }
+        catch
+        {
+            // GetCurrentProcess can throw PlatformNotSupportedException
+        }
+
+        return new Resource(new Dictionary<string, object>
+        {
+            [ResourceSemanticConventions.AttributeServiceName] = defaultServiceName,
+        });
+    }
+
+    internal sealed class WrapperResourceDetector : IResourceDetector
+    {
+        private readonly Resource resource;
+
+        public WrapperResourceDetector(Resource resource)
+        {
+            this.resource = resource;
+        }
+
+        public Resource Detect() => this.resource;
+    }
+
+    private sealed class ResolvingResourceDetector : IResourceDetector
+    {
+        private readonly Func<IServiceProvider?, IResourceDetector> resourceDetectorFactory;
+        private IResourceDetector? resourceDetector;
+
+        public ResolvingResourceDetector(Func<IServiceProvider?, IResourceDetector> resourceDetectorFactory)
+        {
+            this.resourceDetectorFactory = resourceDetectorFactory;
+        }
+
+        public void Resolve(IServiceProvider? serviceProvider)
+        {
+            this.resourceDetector = this.resourceDetectorFactory(serviceProvider)
+                ?? throw new InvalidOperationException("ResourceDetector factory did not return a ResourceDetector instance.");
+        }
+
+        public Resource Detect()
+        {
+            var detector = this.resourceDetector;
+
+            return detector?.Detect() ?? Resource.Empty;
+        }
+    }
+}
+//--------------------------Ʌ
+
+//-------------------V
+public class Resource
+{
+    public Resource(IEnumerable<KeyValuePair<string, object>> attributes)
+    {
+        if (attributes == null)
+        {
+            OpenTelemetrySdkEventSource.Log.InvalidArgument("Create resource", "attributes", "are null");
+            this.Attributes = [];
+            return;
+        }
+
+        // resource creation is expected to be done a few times during app startup i.e. not on the hot path, we can copy attributes.
+        this.Attributes = attributes.Select(SanitizeAttribute).ToList();
+    }
+    public static Resource Empty { get; } = new([]);
+    public IEnumerable<KeyValuePair<string, object>> Attributes { get; }
+
+    public Resource Merge(Resource other)
+    {
+        var newAttributes = new Dictionary<string, object>();
+
+        if (other != null)
+        {
+            foreach (var attribute in other.Attributes)
+            {
+                if (!newAttributes.TryGetValue(attribute.Key, out _))
+                    newAttributes[attribute.Key] = attribute.Value;
+            }
+        }
+
+        foreach (var attribute in this.Attributes)
+        {
+            if (!newAttributes.TryGetValue(attribute.Key, out _))
+                newAttributes[attribute.Key] = attribute.Value;
+        }
+
+        return new Resource(newAttributes);
+    }
+
+    private static KeyValuePair<string, object> SanitizeAttribute(KeyValuePair<string, object> attribute)
+    {
+        string sanitizedKey;
+        if (attribute.Key == null)
+        {
+            OpenTelemetrySdkEventSource.Log.InvalidArgument("Create resource", "attribute key", "Attribute key should be non-null string.");
+            sanitizedKey = string.Empty;
+        }
+        else
+            sanitizedKey = attribute.Key;
+
+        var sanitizedValue = SanitizeValue(attribute.Value, sanitizedKey);
+        return new KeyValuePair<string, object>(sanitizedKey, sanitizedValue);
+    }
+
+    private static object SanitizeValue(object value, string keyName)
+    {
+        return value switch
+        {
+            string => value,
+            bool => value,
+            double => value,
+            int => Convert.ToInt64(value, CultureInfo.InvariantCulture),
+            int[] v => Array.ConvertAll(v, Convert.ToInt64),
+            // ...
+            _ => throw new ArgumentException("Attribute value type is not an accepted primitive", keyName),
+        };
+    }
+}
+//-------------------Ʌ
+
+//-------------------------------------------V
+public static class ResourceBuilderExtensions
+{
+    private static readonly string InstanceId = Guid.NewGuid().ToString();
+
+    private static Resource TelemetryResource { get; } = new Resource(new Dictionary<string, object>
+    {
+        [ResourceSemanticConventions.AttributeTelemetrySdkName] = "opentelemetry",
+        [ResourceSemanticConventions.AttributeTelemetrySdkLanguage] = "dotnet",
+        [ResourceSemanticConventions.AttributeTelemetrySdkVersion] = Sdk.InformationalVersion,
+    });
+
+    public static ResourceBuilder AddService(
+        this ResourceBuilder resourceBuilder,
+        string serviceName,
+        string? serviceNamespace = null,
+        string? serviceVersion = null,
+        bool autoGenerateServiceInstanceId = true,
+        string? serviceInstanceId = null)
+    {
+        Dictionary<string, object> resourceAttributes = new Dictionary<string, object>();
+
+
+        resourceAttributes.Add(ResourceSemanticConventions.AttributeServiceName, serviceName);
+
+        if (!string.IsNullOrEmpty(serviceNamespace))
+            resourceAttributes.Add(ResourceSemanticConventions.AttributeServiceNamespace, serviceNamespace!);
+
+        if (!string.IsNullOrEmpty(serviceVersion))
+            resourceAttributes.Add(ResourceSemanticConventions.AttributeServiceVersion, serviceVersion!);
+
+        if (serviceInstanceId == null && autoGenerateServiceInstanceId)
+            serviceInstanceId = InstanceId;
+
+        if (serviceInstanceId != null)
+            resourceAttributes.Add(ResourceSemanticConventions.AttributeServiceInstance, serviceInstanceId);
+
+        return resourceBuilder.AddResource(new Resource(resourceAttributes));
+    }
+
+    public static ResourceBuilder AddTelemetrySdk(this ResourceBuilder resourceBuilder)
+    {
+        return resourceBuilder.AddResource(TelemetryResource);
+    }
+
+    public static ResourceBuilder AddAttributes(this ResourceBuilder resourceBuilder, IEnumerable<KeyValuePair<string, object>> attributes)
+    {
+        return resourceBuilder.AddResource(new Resource(attributes));
+    }
+
+    public static ResourceBuilder AddEnvironmentVariableDetector(this ResourceBuilder resourceBuilder)
+    {
+        Lazy<IConfiguration> configuration = new Lazy<IConfiguration>(() => new ConfigurationBuilder().AddEnvironmentVariables().Build());
+
+        return resourceBuilder
+            .AddDetectorInternal(sp => new OtelEnvResourceDetector(sp?.GetService<IConfiguration>() ?? configuration.Value))
+            .AddDetectorInternal(sp => new OtelServiceNameEnvVarDetector(sp?.GetService<IConfiguration>() ?? configuration.Value));
+    }
+}
+//-------------------------------------------Ʌ
+
+//-------------------------------------------------V
+internal sealed class OtelServiceNameEnvVarDetector : IResourceDetector
+{
+    public const string EnvVarKey = "OTEL_SERVICE_NAME";
+
+    private readonly IConfiguration configuration;
+
+    public OtelServiceNameEnvVarDetector(IConfiguration configuration)
+    {
+        this.configuration = configuration;
+    }
+
+    public Resource Detect()
+    {
+        var resource = Resource.Empty;
+
+        if (this.configuration.TryGetStringValue(EnvVarKey, out string? envResourceAttributeValue))
+        {
+            resource = new Resource(new Dictionary<string, object>
+            {
+                [ResourceSemanticConventions.AttributeServiceName] = envResourceAttributeValue,
+            });
+        }
+
+        return resource;
+    }
+}
+//-------------------------------------------------Ʌ
+
 //------------------------------------V
 public abstract class BaseProcessor<T> : IDisposable
 {
@@ -3802,6 +4102,311 @@ Resource associated with Activity:
 ```
 
 ```C#
+//---------------------------------------------------V
+public static class OtlpTraceExporterHelperExtensions
+{
+    public static TracerProviderBuilder AddOtlpExporter(this TracerProviderBuilder builder)
+        => AddOtlpExporter(builder, name: null, configure: null);
+
+    public static TracerProviderBuilder AddOtlpExporter(this TracerProviderBuilder builder, Action<OtlpExporterOptions> configure)
+        => AddOtlpExporter(builder, name: null, configure);
+
+    public static TracerProviderBuilder AddOtlpExporter(this TracerProviderBuilder builder, string? name,Action<OtlpExporterOptions>? configure)
+    {
+        var finalOptionsName = name ?? Options.DefaultName;
+
+        builder.ConfigureServices(services =>
+        {
+            if (name != null && configure != null)
+            {
+                // If we are using named options we register the
+                // configuration delegate into options pipeline.
+                services.Configure(finalOptionsName, configure);
+            }
+
+            services.AddOtlpExporterTracingServices();
+        });
+
+        return builder.AddProcessor(sp =>
+        {
+            OtlpExporterOptions exporterOptions;
+
+            if (name == null)
+            {
+                exporterOptions = sp.GetRequiredService<IOptionsFactory<OtlpExporterOptions>>().Create(finalOptionsName);
+
+                // Configuration delegate is executed inline on the fresh instance.
+                configure?.Invoke(exporterOptions);
+            }
+            else
+            {
+                // When using named options we can properly utilize Options
+                // API to create or reuse an instance.
+                exporterOptions = sp.GetRequiredService<IOptionsMonitor<OtlpExporterOptions>>().Get(finalOptionsName);
+            }
+
+            // Note: Not using finalOptionsName here for SdkLimitOptions.
+            // There should only be one provider for a given service
+            // collection so SdkLimitOptions is treated as a single default
+            // instance.
+            var sdkLimitOptions = sp.GetRequiredService<IOptionsMonitor<SdkLimitOptions>>().CurrentValue;
+
+            return BuildOtlpExporterProcessor(
+                sp,
+                exporterOptions,
+                sdkLimitOptions,
+                sp.GetRequiredService<IOptionsMonitor<ExperimentalOptions>>().Get(finalOptionsName));
+        });
+    }
+
+    internal static BaseProcessor<Activity> BuildOtlpExporterProcessor(
+        IServiceProvider serviceProvider,
+        OtlpExporterOptions exporterOptions,
+        SdkLimitOptions sdkLimitOptions,
+        ExperimentalOptions experimentalOptions,
+        Func<BaseExporter<Activity>, BaseExporter<Activity>>? configureExporterInstance = null)
+        => BuildOtlpExporterProcessor(
+            serviceProvider,
+            exporterOptions,
+            sdkLimitOptions,
+            experimentalOptions,
+            exporterOptions.ExportProcessorType,
+            exporterOptions.BatchExportProcessorOptions ?? new BatchExportActivityProcessorOptions(),
+            skipUseOtlpExporterRegistrationCheck: false,
+            configureExporterInstance: configureExporterInstance);
+
+    internal static BaseProcessor<Activity> BuildOtlpExporterProcessor(
+        IServiceProvider serviceProvider,
+        OtlpExporterOptions exporterOptions,
+        SdkLimitOptions sdkLimitOptions,
+        ExperimentalOptions experimentalOptions,
+        ExportProcessorType exportProcessorType,
+        BatchExportProcessorOptions<Activity> batchExportProcessorOptions,
+        bool skipUseOtlpExporterRegistrationCheck = false,
+        Func<BaseExporter<Activity>, BaseExporter<Activity>>? configureExporterInstance = null)
+    {
+        if (!skipUseOtlpExporterRegistrationCheck)
+        {
+            serviceProvider!.EnsureNoUseOtlpExporterRegistrations();
+        }
+
+        if (configureExporterInstance != null)
+        {
+            otlpExporter = configureExporterInstance(otlpExporter);
+        }
+
+        if (exportProcessorType == ExportProcessorType.Simple)
+        {
+            return new SimpleActivityExportProcessor(otlpExporter);
+        }
+        else
+        {
+            return new BatchActivityExportProcessor(
+                otlpExporter,
+                batchExportProcessorOptions!.MaxQueueSize,
+                batchExportProcessorOptions.ScheduledDelayMilliseconds,
+                batchExportProcessorOptions.ExporterTimeoutMilliseconds,
+                batchExportProcessorOptions.MaxExportBatchSize);
+        }
+    }
+}
+//---------------------------------------------------Ʌ
+
+//-----------------------------------------------------V
+public class OtlpExporterOptions : IOtlpExporterOptions
+{
+    internal const string DefaultGrpcEndpoint = "http://localhost:4317";
+    internal const string DefaultHttpEndpoint = "http://localhost:4318";
+    internal const OtlpExportProtocol DefaultOtlpExportProtocol = OtlpExportProtocol.HttpProtobuf;
+
+    internal static readonly KeyValuePair<string, string>[] StandardHeaders = new KeyValuePair<string, string>[]
+    {
+        new("User-Agent", GetUserAgentString()),
+    };
+
+    internal readonly Func<HttpClient> DefaultHttpClientFactory;
+
+    private OtlpExportProtocol? protocol;
+    private Uri? endpoint;
+    private int? timeoutMilliseconds;
+    private Func<HttpClient>? httpClientFactory;
+
+    public OtlpExporterOptions() : this(OtlpExporterOptionsConfigurationType.Default) { }
+
+    internal OtlpExporterOptions(OtlpExporterOptionsConfigurationType configurationType) : this(
+       configuration: new ConfigurationBuilder().AddEnvironmentVariables().Build(),
+       configurationType,
+       defaultBatchOptions: new()) { }
+
+    internal OtlpExporterOptions(IConfiguration configuration, OtlpExporterOptionsConfigurationType configurationType, BatchExportActivityProcessorOptions defaultBatchOptions)
+    {
+        this.ApplyConfiguration(configuration, configurationType);
+
+        this.DefaultHttpClientFactory = () =>
+        {
+            return new HttpClient
+            {
+                Timeout = TimeSpan.FromMilliseconds(this.TimeoutMilliseconds),
+            };
+        };
+
+        this.BatchExportProcessorOptions = defaultBatchOptions!;
+    }
+
+    public Uri Endpoint
+    {
+        get
+        {
+            if (this.endpoint == null)
+                return this.Protocol == OtlpExportProtocol.Grpc ? new Uri(DefaultGrpcEndpoint) : new Uri(DefaultHttpEndpoint);
+
+            return this.endpoint;
+        }
+        set
+        {
+            this.endpoint = value;
+            this.AppendSignalPathToEndpoint = false;
+        }
+    }
+
+    public string? Headers { get; set; }
+
+    public int TimeoutMilliseconds
+    {
+        get => this.timeoutMilliseconds ?? 10000;
+        set => this.timeoutMilliseconds = value;
+    }
+
+    public OtlpExportProtocol Protocol
+    {
+        get => this.protocol ?? DefaultOtlpExportProtocol;
+        set => this.protocol = value;
+    }
+
+    public ExportProcessorType ExportProcessorType { get; set; } = ExportProcessorType.Batch;
+
+    public BatchExportProcessorOptions<Activity> BatchExportProcessorOptions { get; set; }
+
+    public Func<HttpClient> HttpClientFactory
+    {
+        get => this.httpClientFactory ?? this.DefaultHttpClientFactory;
+        set
+        {
+            this.httpClientFactory = value;
+        }
+    }
+
+    internal bool AppendSignalPathToEndpoint { get; private set; } = true;
+
+    internal bool HasData => this.protocol.HasValue || this.endpoint != null || this.timeoutMilliseconds.HasValue || this.httpClientFactory != null;
+
+    internal static OtlpExporterOptions CreateOtlpExporterOptions(IServiceProvider serviceProvider, IConfiguration configuration, string name)
+        => new(
+            configuration,
+            OtlpExporterOptionsConfigurationType.Default,
+            serviceProvider.GetRequiredService<IOptionsMonitor<BatchExportActivityProcessorOptions>>().Get(name));
+
+    internal void ApplyConfigurationUsingSpecificationEnvVars(
+        IConfiguration configuration,
+        string endpointEnvVarKey,
+        bool appendSignalPathToEndpoint,
+        string protocolEnvVarKey,
+        string headersEnvVarKey,
+        string timeoutEnvVarKey)
+    {
+        if (configuration.TryGetUriValue(OpenTelemetryProtocolExporterEventSource.Log, endpointEnvVarKey, out var endpoint))
+        {
+            this.endpoint = endpoint;
+            this.AppendSignalPathToEndpoint = appendSignalPathToEndpoint;
+        }
+
+        if (configuration.TryGetValue<OtlpExportProtocol>(
+            OpenTelemetryProtocolExporterEventSource.Log,
+            protocolEnvVarKey,
+            OtlpExportProtocolParser.TryParse,
+            out var protocol))
+        {
+            this.Protocol = protocol;
+        }
+
+        if (configuration.TryGetStringValue(headersEnvVarKey, out var headers))
+        {
+            this.Headers = headers;
+        }
+
+        if (configuration.TryGetIntValue(OpenTelemetryProtocolExporterEventSource.Log, timeoutEnvVarKey, out var timeout))
+        {
+            this.TimeoutMilliseconds = timeout;
+        }
+    }
+
+    internal OtlpExporterOptions ApplyDefaults(OtlpExporterOptions defaultExporterOptions)
+    {
+        this.protocol ??= defaultExporterOptions.protocol;
+
+        this.endpoint ??= defaultExporterOptions.endpoint;
+
+        // Note: We leave AppendSignalPathToEndpoint set to true here because we
+        // want to append the signal if the endpoint came from the default
+        // endpoint.
+
+        this.Headers ??= defaultExporterOptions.Headers;
+
+        this.timeoutMilliseconds ??= defaultExporterOptions.timeoutMilliseconds;
+
+        this.httpClientFactory ??= defaultExporterOptions.httpClientFactory;
+
+        return this;
+    }
+
+    private static string GetUserAgentString()
+    {
+        var assembly = typeof(OtlpExporterOptions).Assembly;
+        return $"OTel-OTLP-Exporter-Dotnet/{assembly.GetPackageVersion()}";
+    }
+
+    private void ApplyConfiguration(IConfiguration configuration, OtlpExporterOptionsConfigurationType configurationType)
+    {
+        // Note: When using the "AddOtlpExporter" extensions configurationType
+        // never has a value other than "Default" because OtlpExporterOptions is
+        // shared by all signals and there is no way to differentiate which
+        // signal is being constructed.
+        if (configurationType == OtlpExporterOptionsConfigurationType.Default)
+        {
+            this.ApplyConfigurationUsingSpecificationEnvVars(
+                configuration!,
+                OtlpSpecConfigDefinitions.DefaultEndpointEnvVarName,
+                appendSignalPathToEndpoint: true,
+                OtlpSpecConfigDefinitions.DefaultProtocolEnvVarName,
+                OtlpSpecConfigDefinitions.DefaultHeadersEnvVarName,
+                OtlpSpecConfigDefinitions.DefaultTimeoutEnvVarName);
+        }
+        else if (configurationType == OtlpExporterOptionsConfigurationType.Logs)
+        {
+            this.ApplyConfigurationUsingSpecificationEnvVars(
+                configuration!,
+                OtlpSpecConfigDefinitions.LogsEndpointEnvVarName,
+                appendSignalPathToEndpoint: false,
+                OtlpSpecConfigDefinitions.LogsProtocolEnvVarName,
+                OtlpSpecConfigDefinitions.LogsHeadersEnvVarName,
+                OtlpSpecConfigDefinitions.LogsTimeoutEnvVarName);
+        }
+        else if (configurationType == OtlpExporterOptionsConfigurationType.Metrics)
+        {
+            // ...
+        }
+        else if (configurationType == OtlpExporterOptionsConfigurationType.Traces)
+        {
+            // ...
+        }
+        else
+        {
+            throw new NotSupportedException($"OtlpExporterOptionsConfigurationType '{configurationType}' is not supported.");
+        }
+    }
+}
+//-----------------------------------------------------Ʌ
+
 //------------------------------------------------V
 public static class JaegerExporterHelperExtensions
 {
