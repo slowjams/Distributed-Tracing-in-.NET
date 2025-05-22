@@ -125,7 +125,7 @@ public class Activity : IDisposable  // In .NET world, a span is represented by 
             SetCurrent(_previousActiveActivity);
         }
     }
-    public Activity Start()   // <-------------------------pact3.0, cact3.0
+    public Activity Start()   // <-------------------------pact3.0, cact3.0, dlr3.2.4.5
     {
         if (_id != null || _spanId != null)
         {
@@ -169,21 +169,21 @@ public class Activity : IDisposable  // In .NET world, a span is represented by 
         return this;
     }
 
-    internal static Activity Create(            // <-------------------------pact2.0
-                                    ActivitySource source, 
-                                    string name, 
-                                    ActivityKind kind, 
-                                    string? parentId, 
-                                    ActivityContext parentContext,
-                                    IEnumerable<KeyValuePair<string, object?>>? tags,
-                                    IEnumerable<ActivityLink>? links,
-                                    DateTimeOffset startTime,
-                                    ActivityTagsCollection? samplerTags, 
-                                    ActivitySamplingResult request, 
-                                    bool startIt,   // <----------------------------------
-                                    ActivityIdFormat idFormat,
-                                    string? traceState
-                                    )
+    internal static Activity Create(            // <-------------------------pact2.0, dlr3.2.4.2
+        ActivitySource source, 
+        string name, 
+        ActivityKind kind, 
+        string? parentId, 
+        ActivityContext parentContext,
+        IEnumerable<KeyValuePair<string, object?>>? tags,
+        IEnumerable<ActivityLink>? links,
+        DateTimeOffset startTime,
+        ActivityTagsCollection? samplerTags, 
+        ActivitySamplingResult request, 
+        bool startIt,   // <----------------------------------
+        ActivityIdFormat idFormat,
+        string? traceState
+    )
     {
         Activity activity = new Activity(name);    // <-------------------------pact2.1
  
@@ -232,7 +232,7 @@ public class Activity : IDisposable  // In .NET world, a span is represented by 
         }
         else if (parentContext != default)
         {
-            activity._traceId = parentContext.TraceId.ToString();
+            activity._traceId = parentContext.TraceId.ToString();  // <-------------------------dlr3.2.4.3
 
             if (parentContext.SpanId != default)
             {
@@ -259,7 +259,7 @@ public class Activity : IDisposable  // In .NET world, a span is represented by 
 
         if (startIt)
         {
-            activity.Start();  // <-------------------------pact2.2.
+            activity.Start();  // <-------------------------pact2.2., dlr3.2.4.4
         }
 
         return activity;
@@ -307,13 +307,45 @@ public class Activity : IDisposable  // In .NET world, a span is represented by 
         return _traceId != null;
     }
 
+    internal static bool TryConvertIdToContext(string traceParent, string? traceState, bool isRemote, out ActivityContext context) // <---------------dlr3.2.2
+    {
+        context = default;
+        if (!IsW3CId(traceParent))
+        {
+            return false;
+        }
+
+        ReadOnlySpan<char> traceIdSpan = traceParent.AsSpan(3, 32);
+        ReadOnlySpan<char> spanIdSpan = traceParent.AsSpan(36, 16);
+
+        if (!ActivityTraceId.IsLowerCaseHexAndNotAllZeros(traceIdSpan) || !ActivityTraceId.IsLowerCaseHexAndNotAllZeros(spanIdSpan) ||
+            !HexConverter.IsHexLowerChar(traceParent[53]) || !HexConverter.IsHexLowerChar(traceParent[54]))
+        {
+            return false;
+        }
+
+        context = new ActivityContext(                                  // <---------------dlr3.2.3
+                        new ActivityTraceId(traceIdSpan.ToString()),
+                        new ActivitySpanId(spanIdSpan.ToString()),
+                        (ActivityTraceFlags)ActivityTraceId.HexByteFromChars(traceParent[53], traceParent[54]),
+                        traceState,
+                        isRemote);
+
+        return true;
+    }
+
+    public string DisplayName 
+    {
+        get => _displayName ?? OperationName;
+        set => _displayName = value ?? throw new ArgumentNullException(nameof(value));
+    }
+    public string OperationName { get; }  // <-------no setter for OperationName
+    public ActivitySource Source { get; }
+
     public bool IsAllDataRequested { get; set; }
     public ActivityIdFormat IdFormat { get; }
     public ActivityKind Kind { get; }
-    public string OperationName { get; }
-    public string DisplayName { get; set; }
     public IEnumerable<ActivityEvent> Events { get; }
-    public ActivitySource Source { get; }
     public IEnumerable<ActivityLink> Links { get; }
     public ActivitySpanId ParentSpanId { get; }       // <------------------------------
     public bool Recorded { get; }
@@ -425,6 +457,9 @@ public sealed class ActivitySource : IDisposable
         return listeners != null && listeners.Count > 0;
     }
 
+    public Activity? StartActivity(string name = "", ActivityKind kind = ActivityKind.Internal)
+        => CreateActivity(name, kind, default, null, null, null, default);
+
     public Activity? StartActivity(            // <-------------------------pact1.0, cact1.0
                                 string name,   
                                 ActivityKind kind,
@@ -436,7 +471,7 @@ public sealed class ActivitySource : IDisposable
         => CreateActivity(name, kind, parentContext, null, tags, links, startTime);   // <-------------------------pact1.0, cact1.0
                                                                                      
     // ...
-    private Activity? CreateActivity(   // <------------------------pact1.1, cact1.1
+    private Activity? CreateActivity(   // <------------------------pact1.1, cact1.1, dlr3.2.4.0
                                      string name,   
                                      ActivityKind kind,
                                      ActivityContext context, 
@@ -565,9 +600,9 @@ public sealed class ActivitySource : IDisposable
             traceState = aco.TraceState;
         }
 
-        if (samplingResult != ActivitySamplingResult.None)
+        if (samplingResult != ActivitySamplingResult.None)  // <-------------------------------------sam, discard the creation of Activity if needed
         {
-            activity =  Activity.Create(this, name, kind, parentId, context, tags, links, startTime, samplerTags, samplingResult, startIt, idFormat, traceState);
+            activity =  Activity.Create(this, name, kind, parentId, context, tags, links, startTime, samplerTags, samplingResult, startIt, idFormat, traceState); // dlr3.2.4.1
                         // <-------------------------pact1.2., cact1.2.                   startIt is true by default
         }
 
@@ -707,7 +742,7 @@ public readonly partial struct ActivityContext : IEquatable<ActivityContext>
     public string? TraceState { get; }
 
     public bool IsRemote { get; }
-    public static bool TryParse(string? traceParent, string? traceState, bool isRemote, out ActivityContext context)
+    public static bool TryParse(string? traceParent, string? traceState, bool isRemote, out ActivityContext context)  // <---------------dlr3.2.0
     {
         if (traceParent is null)
         {
@@ -715,7 +750,7 @@ public readonly partial struct ActivityContext : IEquatable<ActivityContext>
             return false;
         }
 
-        return Activity.TryConvertIdToContext(traceParent, traceState, isRemote, out context);
+        return Activity.TryConvertIdToContext(traceParent, traceState, isRemote, out context);  // <---------------dlr3.2.1
     }
 
     public static bool TryParse(string? traceParent, string? traceState, out ActivityContext context) => TryParse(traceParent, traceState, isRemote: false, out context);
@@ -734,6 +769,141 @@ public readonly partial struct ActivityContext : IEquatable<ActivityContext>
     public static bool operator !=(ActivityContext left, ActivityContext right) => !(left == right);
 }
 //--------------------------------------------Ʌ
+
+//----------------------------------V
+public sealed class ActivityListener : IDisposable
+{
+    // public delegate ActivitySamplingResult SampleActivity<T>(ref ActivityCreationOptions<T> options);
+    // public delegate void ExceptionRecorder(Activity activity, Exception exception, ref TagList tags);
+
+    public ActivityListener() { }
+
+    public Action<Activity>? ActivityStarted { get; set; }
+    
+    public Action<Activity>? ActivityStopped { get; set; }
+    
+    public ExceptionRecorder? ExceptionRecorder { get; set; }
+    
+    public Func<ActivitySource, bool>? ShouldListenTo { get; set; }
+    
+    public SampleActivity<string>? SampleUsingParentId { get; set; }
+
+    public SampleActivity<ActivityContext>? Sample { get; set; }
+
+    public void Dispose() => ActivitySource.DetachListener(this);
+}
+//----------------------------------Ʌ
+
+//-----------------------------------------------V
+public readonly struct ActivityCreationOptions<T>
+{
+    private readonly ActivityTagsCollection? _samplerTags;
+    private readonly ActivityContext _context;
+    private readonly string? _traceState;
+
+    internal ActivityCreationOptions(ActivitySource source, string name, T parent, ActivityKind kind, IEnumerable<KeyValuePair<string, object?>>? tags, IEnumerable<ActivityLink>? links, ActivityIdFormat idFormat)
+    {
+        Source = source;
+        Name = name;
+        Kind = kind;
+        Parent = parent;
+        Tags = tags;
+        Links = links;
+        IdFormat = idFormat;
+
+        if (IdFormat == ActivityIdFormat.Unknown && Activity.ForceDefaultIdFormat)
+            IdFormat = Activity.DefaultIdFormat;
+
+        _samplerTags = null;
+        _traceState = null;
+
+        if (parent is ActivityContext ac && ac != default)
+        {
+            _context = ac;
+            if (IdFormat == ActivityIdFormat.Unknown)
+                IdFormat = ActivityIdFormat.W3C;
+
+            _traceState = ac.TraceState;
+        }
+        else if (parent is string p)
+        {
+            if (IdFormat != ActivityIdFormat.Hierarchical)
+            {
+                if (ActivityContext.TryParse(p, null, out _context))
+                    IdFormat = ActivityIdFormat.W3C;
+
+                if (IdFormat == ActivityIdFormat.Unknown)
+                    IdFormat = ActivityIdFormat.Hierarchical;
+            }
+            else
+                _context = default;
+        }
+        else
+        {
+            _context = default;
+            if (IdFormat == ActivityIdFormat.Unknown)
+                IdFormat = Activity.Current != null ? Activity.Current.IdFormat : Activity.DefaultIdFormat;
+        }
+    }
+
+    public ActivitySource Source { get; }
+
+    public string Name { get; }
+
+    public ActivityKind Kind { get; }
+
+    public T Parent { get; }
+
+    public IEnumerable<KeyValuePair<string, object?>>? Tags { get; }
+
+    public IEnumerable<ActivityLink>? Links { get; }
+
+    public ActivityTagsCollection SamplingTags
+    {
+        get
+        {
+            if (_samplerTags == null)
+                Unsafe.AsRef(in _samplerTags) = new ActivityTagsCollection();
+
+            return _samplerTags!;
+        }
+    }
+
+    public ActivityTraceId TraceId
+    {
+        get
+        {
+            if (Parent is ActivityContext && IdFormat == ActivityIdFormat.W3C && _context == default)
+            {
+                Func<ActivityTraceId>? traceIdGenerator = Activity.TraceIdGenerator;
+                ActivityTraceId id = traceIdGenerator == null ? ActivityTraceId.CreateRandom() : traceIdGenerator();
+
+                // Because the struct is readonly, we cannot directly assign _context. We have to workaround it by calling Unsafe.AsRef
+                Unsafe.AsRef(in _context) = new ActivityContext(id, default, ActivityTraceFlags.None);
+            }
+
+            return _context.TraceId;
+        }
+    }
+
+    public string? TraceState
+    {
+        get => _traceState;
+        init
+        {
+            _traceState = value;
+        }
+    }
+
+    internal void SetTraceState(string? traceState) => Unsafe.AsRef(in _traceState) = traceState;
+
+    internal ActivityIdFormat IdFormat { get; }
+
+    internal ActivityTagsCollection? GetSamplingTags() => _samplerTags;
+
+    internal ActivityContext GetContext() => _context;
+}
+//-----------------------------------------------Ʌ
 ```
 
 ```C#

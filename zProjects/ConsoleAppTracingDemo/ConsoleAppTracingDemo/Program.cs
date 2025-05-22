@@ -24,7 +24,7 @@ namespace ConsoleAppTracingDemo
 
             ActivitySource.AddActivityListener(listener);
 
-            using (Activity parentActivity = ActivitySource.StartActivity("ParentActivity")!)   // start a parent activity
+            using (Activity parentActivity = ActivitySource.StartActivity("ParentActivity")!)   // start a parent activity, its internal ActivityContext is null,  check dlrspecial
             {
                 parentActivity.SetTag("rootTag", "This is the root activity.");    // set some additional information on the root activity
 
@@ -40,7 +40,7 @@ namespace ConsoleAppTracingDemo
                 //Activity.Current = parentActivity;   // no need to explicit set parentActivity to Current,
                                                        // <----------cact3.0, see how Activity.Start() automatically set parentActivity to Activity.Current
 
-                using (Activity childActivity = ActivitySource.StartActivity("ChildActivity")!)  // Additional child activity within the root activity
+                using (Activity childActivity = ActivitySource.StartActivity("ChildActivity")!)  // Additional child activity within the root activity, its internal ActivityContext is also null, check dlrspecial
                 {
                     childActivity.SetTag("childTag", "This is another child activity.");
 

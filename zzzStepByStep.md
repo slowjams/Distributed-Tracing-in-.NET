@@ -92,7 +92,7 @@ serviceA uses `HttpClient` to send request on `http://localhost:5050/memes/dotne
 
 2. serviceB receives request (`http://localhost:5050/memes/dotnet`)
 
-When  serviceB receives the HTTP request, `GenericWebHostService`'s `HostingApplication` creates an `HttpContext` (which contains the traceparent header) ─► `HostingApplicationDiagnostics` calls `DistributedContextPropagator.ExtractTraceIdAndState()` on `HttpContext`'s headers to extract the trace id and then
+When serviceB receives the HTTP request, `GenericWebHostService`'s `HostingApplication` creates an `HttpContext` (which contains the traceparent header) ─► `HostingApplicationDiagnostics` calls `DistributedContextPropagator.ExtractTraceIdAndState()` on `HttpContext`'s headers to extract the trace id and then
  creates `new Activity("Microsoft.AspNetCore.Hosting.HttpRequestIn")` (let's call it `activityB1`), `activityB1`'s parent is set to be `activityA2` (refer to dlr) 
 
 

@@ -21,10 +21,34 @@ public class Program
                 })
                 .AddHttpClientInstrumentation() // <-------------------add listener(HttpHandlerDiagnosticListener) for ActivitySource("System.Net.Http") 
                 .AddConsoleExporter()
-                .AddJaegerExporter()
+                .SetResourceBuilder(ResourceBuilder.CreateDefault().AddService("App1"))
+                .AddOtlpExporter(opts =>  // opts is OtlpExporterOptions
+                {
+                    opts.Protocol = OtlpExportProtocol.Grpc;  // no really need to set it as by default OTLP over gRPC, setting the protocol explicitly is a good practice
+                    opts.Endpoint = new Uri("http://localhost:4317");  // port 4317 is OpenTelemetry Collector's gRPC receiver, need OpenTelemetry Collector as separate process
+                                                                       // e.g using docker with image otel/opentelemetry-collector:latest
+                })
+                /*
+                .AddJaegerExporter(opts =>
+                {
+                    opts.Protocol = JaegerExportProtocol.Grpc;
+                    opts.Endpoint = new Uri("http://localhost:14268/api/traces"); // OpenTelemetry Collector's Jaeger HTTP receiver , need OpenTelemetry Collector as separate process
+                                                                                  // e.g using docker with image otel/opentelemetry-collector:latest            
+                })
+                .AddJaegerExporter(opts =>
+                {
+                    opts.Protocol = JaegerExportProtocol.Grpc;
+                    opts.Endpoint = new Uri("http://jaeger.mydomain.local:14250"); // bypass OpenTelemetry Collector, send tracs to Jaeger directly
+                })
+                */
                 .AddSource("Tracing.NET")  // <----------------- check acts to see how ActivityListener in tpsact can use this setting
         //...
     }
+
+    /*
+       port 4317 is OpenTelemetry Collector's gRPC receiver
+       port 14268 is jaeger's collector on HTTP
+    */
 }
 ```
 ```C#
@@ -48,6 +72,32 @@ public class WeatherForecastController : ControllerBase
     }
 }
 ```
+
+```yaml
+# NET Activity	             OTLP Field (Protobuf)            Jaeger Field (Protobuf)
+Activity.TraceId	         span.trace_id                    span.traceId
+Activity.SpanId	             span.span_id                     span.spanId
+Activity.ParentSpanId	     span.parent_span_id              span.parentSpanId
+Activity.DisplayName	     span.name                        span.operationName
+Activity.Kind	             span.kind                        span.spanKind 
+Activity.StartTimeUtc	     span.start_time_unix_nano        span.startTime 
+Activity.EndTimeUtc	         span.end_time_unix_nano          span.endTime 
+Activity.Tags	             span.attributes                  span.tags 
+Activity.Events	             span.events                      span.logs 
+Activity.Links	             span.links                       span.references
+Activity.Status	             span.status                      span.status 
+```
+
+================================================================================================================================================================
+
+The OTEL Request Pipeline (pip) is:
+
+0. `TelemetryHostedService.Initialize()` calls `var tracerProvider = serviceProvider!.GetService<TracerProvider>();` 
+
+1. DI `.TryAddSingleton<TracerProvider>(sp => new TracerProviderSdk(sp, ownsServiceProvider: false))`
+   so `new TracerProviderSdk()` is created
+
+2. Inside `TracerProviderSdk`'s Contructor, it does  `var activityListener = new ActivityListener()` and then register activityListener.ActivityStopped to call `processor.OnEnd(activity)`
 
 
 ## Source Code
@@ -96,7 +146,8 @@ internal sealed class TelemetryHostedService : IHostedService
         if (meterProvider == null)
             HostingExtensionsEventSource.Log.MeterProviderNotRegistered();
 
-        var tracerProvider = serviceProvider!.GetService<TracerProvider>();  // <-----------------------------------------ote1.0
+        var tracerProvider = serviceProvider!.GetService<TracerProvider>();  // <-----------------------------------------ote1.0, pip
+                                                                             // DI will hold a reference to it so it won't garbage collected
         if (tracerProvider == null)
             HostingExtensionsEventSource.Log.TracerProviderNotRegistered();
 
@@ -467,8 +518,6 @@ internal sealed class LoggerProviderSdk : LoggerProvider
 
     public void AddProcessor(BaseProcessor<LogRecord> processor)
     {
-        Guard.ThrowIfNull(processor);
-
         processor.SetParentProvider(this);
 
         if (this.threadStaticPool != null && ContainsBatchProcessor(processor))
@@ -642,9 +691,9 @@ internal static class ProviderBuilderServiceCollectionExtensions
         return services!;
     }
 
-    public static IServiceCollection AddOpenTelemetryTracerProviderBuilderServices(this IServiceCollection services)
+    public static IServiceCollection AddOpenTelemetryTracerProviderBuilderServices(this IServiceCollection services)  // <------------pip
     {
-        services!.TryAddSingleton<TracerProviderBuilderSdk>();
+        services!.TryAddSingleton<TracerProviderBuilderSdk>();  //<---------------------------------pip
         services!.RegisterOptionsFactory(configuration => new BatchExportActivityProcessorOptions(configuration));
         services!.RegisterOptionsFactory(
             (sp, configuration, name) => new ActivityExportProcessorOptions(
@@ -730,15 +779,13 @@ public static class TracerProviderBuilderExtensions
         return tracerProviderBuilder;
     }
 
-    public static TracerProviderBuilder SetSampler(this TracerProviderBuilder tracerProviderBuilder, Sampler sampler)
+    public static TracerProviderBuilder SetSampler(this TracerProviderBuilder tracerProviderBuilder, Sampler sampler)  // <--------------------sam0
     {
-        Guard.ThrowIfNull(sampler);
-
         tracerProviderBuilder.ConfigureBuilder((sp, builder) =>
         {
             if (builder is TracerProviderBuilderSdk tracerProviderBuilderSdk)
             {
-                tracerProviderBuilderSdk.SetSampler(sampler);
+                tracerProviderBuilderSdk.SetSampler(sampler);  // <--------------------sam0.1
             }
         });
 
@@ -800,8 +847,8 @@ public static class TracerProviderBuilderExtensions
 
         return tracerProviderBuilder;
     }
-
-    public static TracerProviderBuilder AddProcessor(this TracerProviderBuilder tracerProviderBuilder, BaseProcessor<Activity> processor)
+                                                                             // tracerProviderBuilder is TracerProviderBuilderBase      
+    public static TracerProviderBuilder AddProcessor(this TracerProviderBuilder tracerProviderBuilder, BaseProcessor<Activity> processor) 
     {
         tracerProviderBuilder.ConfigureBuilder((sp, builder) =>
         {
@@ -1818,9 +1865,9 @@ public static class OpenTelemetryBuilderSdkExtensions
 
     public static IOpenTelemetryBuilder WithTracing(this IOpenTelemetryBuilder builder) => WithTracing(builder, b => { });
 
-    public static IOpenTelemetryBuilder WithTracing(this IOpenTelemetryBuilder builder, Action<TracerProviderBuilder> configure) // <----------ote2.0
+    public static IOpenTelemetryBuilder WithTracing(this IOpenTelemetryBuilder builder, Action<TracerProviderBuilder> configure) // <----------ote2.0, pip
     {
-        var tracerProviderBuilder = new TracerProviderBuilderBase(builder.Services);   // <-------------------ote2.1
+        var tracerProviderBuilder = new TracerProviderBuilderBase(builder.Services);   // <-------------------ote2.1, pip
 
         configure(tracerProviderBuilder);  // <-------------------ote2.2.
 
@@ -1923,7 +1970,8 @@ public class TracerProviderBuilderBase : TracerProviderBuilder, ITracerProviderB
     private readonly bool allowBuild;
     private readonly TracerProviderServiceCollectionBuilder innerBuilder;
 
-    public TracerProviderBuilderBase()
+    /*
+    public TracerProviderBuilderBase()  // <--------this constructor is only used by console app where it need to create a new ServiceCollection
     {
         var services = new ServiceCollection();
 
@@ -1937,12 +1985,13 @@ public class TracerProviderBuilderBase : TracerProviderBuilder, ITracerProviderB
 
         this.allowBuild = true;
     }
+    */
 
-    internal TracerProviderBuilderBase(IServiceCollection services)   // <----------------------
+    internal TracerProviderBuilderBase(IServiceCollection services)
     {
         services
             .AddOpenTelemetryTracerProviderBuilderServices()
-            .TryAddSingleton<TracerProvider>(sp => new TracerProviderSdk(sp, ownsServiceProvider: false));
+            .TryAddSingleton<TracerProvider>(sp => new TracerProviderSdk(sp, ownsServiceProvider: false));  // <-----------------pip
 
         this.innerBuilder = new TracerProviderServiceCollectionBuilder(services);
 
@@ -1986,7 +2035,7 @@ public class TracerProviderBuilderBase : TracerProviderBuilder, ITracerProviderB
         return this;
     }
 
-    internal TracerProvider InvokeBuild() => this.Build();
+    internal TracerProvider InvokeBuild() => this.Build();  // <--------------pip
 
     protected TracerProviderBuilder AddInstrumentation(string instrumentationName, string instrumentationVersion, Func<object?> instrumentationFactory)
     {
@@ -2118,7 +2167,7 @@ internal sealed class TracerProviderBuilderSdk : TracerProviderBuilder, ITracerP
 
     public TracerProviderBuilder SetSampler(Sampler sampler)
     {
-        this.Sampler = sampler;
+        this.Sampler = sampler;  // <----------------sam0.2.
 
         return this;
     }
@@ -2222,7 +2271,7 @@ internal sealed class TracerProviderSdk : TracerProvider
         resourceBuilder.ServiceProvider = serviceProvider;
         this.Resource = resourceBuilder.Build();
 
-        this.sampler = GetSampler(serviceProvider!.GetRequiredService<IConfiguration>(), state.Sampler);
+        this.sampler = GetSampler(serviceProvider!.GetRequiredService<IConfiguration>(), state.Sampler);  // <----------------sam0
         OpenTelemetrySdkEventSource.Log.TracerProviderSdkEvent($"Sampler added = \"{this.sampler.GetType()}\".");
 
         this.supportLegacyActivity = state.LegacyActivityOperationNames.Count > 0;
@@ -2368,8 +2417,9 @@ internal sealed class TracerProviderSdk : TracerProvider
         else
         {
             // This delegate informs ActivitySource about sampling decision when the parent context is an ActivityContext.
-            activityListener.Sample = (ref ActivityCreationOptions<ActivityContext> options) =>
+            activityListener.Sample = (ref ActivityCreationOptions<ActivityContext> options) =>      // <---------------------sam, sample is called at ActivitySource.StartActivity
                 !Sdk.SuppressInstrumentation ? ComputeActivitySamplingResult(ref options, this.sampler) : ActivitySamplingResult.None;
+
             this.getRequestedDataAction = this.RunGetRequestedDataOtherSampler;
         }
 
@@ -2408,7 +2458,7 @@ internal sealed class TracerProviderSdk : TracerProvider
             }
         }
 
-        ActivitySource.AddActivityListener(activityListener);
+        ActivitySource.AddActivityListener(activityListener);  // <-------------------------
         this.listener = activityListener;
         OpenTelemetrySdkEventSource.Log.TracerProviderSdkEvent("TracerProvider built successfully.");
     }
@@ -2669,6 +2719,19 @@ internal sealed class TracerProviderSdk : TracerProvider
     }
 }
 //-------------------------------------Ʌ
+
+//--------------------------V
+public enum SamplingDecision
+{
+    Drop,  // The activity will be created but not recorded. Activity.IsAllDataRequested will return false.
+
+    RecordOnly,  // The activity will be created and recorded, but sampling flag will not be set.
+                 // Activity.IsAllDataRequested will return true. Activity.Recorded will return false.
+    
+    RecordAndSample,    // The activity will be created, recorded, and sampling flag will be set.
+                        // Activity.IsAllDataRequested will return true. Activity.Recorded will return true.            
+}
+//--------------------------Ʌ
 
 //--------------------------V
 public class ResourceBuilder
@@ -4186,14 +4249,12 @@ public static class OtlpTraceExporterHelperExtensions
         Func<BaseExporter<Activity>, BaseExporter<Activity>>? configureExporterInstance = null)
     {
         if (!skipUseOtlpExporterRegistrationCheck)
-        {
             serviceProvider!.EnsureNoUseOtlpExporterRegistrations();
-        }
+
+        BaseExporter<Activity> otlpExporter = new OtlpTraceExporter(exporterOptions!, sdkLimitOptions!, experimentalOptions!);  // <-------------------------
 
         if (configureExporterInstance != null)
-        {
             otlpExporter = configureExporterInstance(otlpExporter);
-        }
 
         if (exportProcessorType == ExportProcessorType.Simple)
         {
@@ -4217,7 +4278,14 @@ public class OtlpExporterOptions : IOtlpExporterOptions
 {
     internal const string DefaultGrpcEndpoint = "http://localhost:4317";
     internal const string DefaultHttpEndpoint = "http://localhost:4318";
-    internal const OtlpExportProtocol DefaultOtlpExportProtocol = OtlpExportProtocol.HttpProtobuf;
+    internal const OtlpExportProtocol DefaultOtlpExportProtocol = OtlpExportProtocol.Grpc;  // <-----------------
+    /*
+    public enum OtlpExportProtocol : byte
+    {
+        Grpc = 0,
+        HttpProtobuf = 1,
+    }
+    */
 
     internal static readonly KeyValuePair<string, string>[] StandardHeaders = new KeyValuePair<string, string>[]
     {
@@ -4406,6 +4474,70 @@ public class OtlpExporterOptions : IOtlpExporterOptions
     }
 }
 //-----------------------------------------------------Ʌ
+
+//----------------------------V
+public class OtlpTraceExporter : BaseExporter<Activity>
+{
+    private const int GrpcStartWritePosition = 5;
+    private readonly SdkLimitOptions sdkLimitOptions;
+    private readonly OtlpExporterTransmissionHandler transmissionHandler;
+    private readonly int startWritePosition;
+
+    private Resource? resource;
+
+    private byte[] buffer = new byte[750000];
+
+    public OtlpTraceExporter(OtlpExporterOptions options): this(options, sdkLimitOptions: new(), experimentalOptions: new(), transmissionHandler: null) { }
+
+    internal OtlpTraceExporter(
+        OtlpExporterOptions exporterOptions,
+        SdkLimitOptions sdkLimitOptions,
+        ExperimentalOptions experimentalOptions,
+        OtlpExporterTransmissionHandler? transmissionHandler = null)
+    {
+        this.sdkLimitOptions = sdkLimitOptions!;
+        this.startWritePosition = exporterOptions!.Protocol == OtlpExportProtocol.Grpc ? GrpcStartWritePosition : 0;
+        this.transmissionHandler = transmissionHandler ?? exporterOptions!.GetExportTransmissionHandler(experimentalOptions, OtlpSignalType.Traces);
+    }
+
+    internal Resource Resource => this.resource ??= this.ParentProvider.GetResource();
+
+    public override ExportResult Export(in Batch<Activity> activityBatch)   // serialize Activities to OTLP Protobuf and send to endpoin
+    {
+        // Prevents the exporter's gRPC and HTTP operations from being instrumented.
+        using var scope = SuppressInstrumentationScope.Begin();
+
+        try
+        {
+            int writePosition = ProtobufOtlpTraceSerializer.WriteTraceData(ref this.buffer, this.startWritePosition, this.sdkLimitOptions, this.Resource, activityBatch);
+
+            if (this.startWritePosition == GrpcStartWritePosition)
+            {
+                // Grpc payload consists of 3 parts byte 0 - Specifying if the payload is compressed.
+                //  1-4 byte - Specifies the length of payload in big endian format.
+                // 5 and above -  Protobuf serialized data.
+                Span<byte> data = new Span<byte>(this.buffer, 1, 4);
+                var dataLength = writePosition - GrpcStartWritePosition;
+                BinaryPrimitives.WriteUInt32BigEndian(data, (uint)dataLength);
+            }
+
+            if (!this.transmissionHandler.TrySubmitRequest(this.buffer, writePosition))
+            {
+                return ExportResult.Failure;
+            }
+        }
+        catch (Exception ex)
+        {
+            OpenTelemetryProtocolExporterEventSource.Log.ExportMethodException(ex);
+            return ExportResult.Failure;
+        }
+
+        return ExportResult.Success;
+    }
+
+    protected override bool OnShutdown(int timeoutMilliseconds) => this.transmissionHandler.Shutdown(timeoutMilliseconds);
+}
+//----------------------------Ʌ
 
 //------------------------------------------------V
 public static class JaegerExporterHelperExtensions
