@@ -24,6 +24,9 @@ namespace WeatherForecastSimpleTracing.Controllers
         [HttpGet]
         public IEnumerable<WeatherForecast> Get()
         {
+            var dd = Activity.Current;
+            var ss = Activity.Current.GetTagItem("myTags.count");
+
             return Enumerable.Range(1, 5).Select(index => new WeatherForecast
             {
                 Date = DateOnly.FromDateTime(DateTime.Now.AddDays(index)),
@@ -36,6 +39,8 @@ namespace WeatherForecastSimpleTracing.Controllers
         [HttpGet("OutgoingHttp")]
         public async Task OutgoingHttpRequest()
         {
+            var dd = Activity.Current;
+
             using var activity = _activitySource.StartActivity("AnotherOne");  // <-------------check tpsact see why ActivityListener is not null
             activity.SetTag("myTags.count", 1);
             var userId = Activity.Current.GetBaggageItem("UserId");

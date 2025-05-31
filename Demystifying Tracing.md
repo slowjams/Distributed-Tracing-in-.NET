@@ -53,6 +53,8 @@ A `trace` is a set of related spans fully describing a logical end-to-end operat
 **In .NET world, a `span` is represented by an `Activity`, System.Span class is not related to distributed tracing.**
 
 
+## Activity revisit
+
 ```C#
 class Program
 {
@@ -125,6 +127,160 @@ class Program
 see pact and cact how parentActivity's context passed to childActivity.
 
 
+
+## How OpenTelemetry Fits in >NET
+
+                         .net app                                      
+┌─────────────────────────────────────────────────────────────────────┐
+│                                                                     │
+│           HostingApplication creates HttpContext                    │
+│                            │                                        │
+│                            ▼                                        │
+│ HostingApplication calls HostingApplicationDiagnostics.BeginRequest │
+│                            │                                        │
+│                            ▼                                        │
+│            BeginRequest creates an Activity                         │
+│                            │                                        │
+│                            ▼                                        │
+│       tracer's sample called to set act's trace flag                │
+│                            │                                        │
+│                            ▼                                        │
+│          tracerListener's ActivityStarted called                    │
+│                            │                                        │
+│                            ▼                                        │
+│           BatchExportProcessor.OnStart called                       │
+│                            │                                        │
+│                            ▼                                        │
+│           HttpInListener.OnStartActivity called                     │
+│                            │                                        │
+│                            ▼                                        │
+│               EnrichWithHttpRequest invoked                         │
+│                            │                                        │
+│                            ▼                                        │
+│  HostingApplication executes middlewares pipeline with HttpContext  │
+│                            │                                        │
+│                            ▼                                        │
+│                   request pipeline ends                             │
+│                            │                                        │
+│                            ▼                                        │
+│  HostingApplication calls HostingApplicationDiagnostics.RequestEnd  │
+│                            │                                        │
+│                            ▼                                        │
+│             HttpInListener.OnStopActivity called                    │
+│                            │                                        │
+│                            ▼                                        │
+│             EnrichWithHttpResponse invoked                          │
+│                            │                                        │
+│                            ▼                                        │
+│     act stopped by HostingApplicationDiagnostics.RequestEnd         │
+│                            │                                        │
+│                            ▼                                        │
+│          tracerListener's ActivityStopped called                    │
+│                            │                                        │
+│                            ▼                                        │
+│            BatchExportProcessor.OnEnd called                        │
+│                            │                                        │
+│                            ▼                                        │
+│ ┌─────── OtlpTraceExporter.Export(activityBatch)                    │
+│ │                          Or                                       │
+│ │ ┌────────JaegerExporter.Export(activityBatch)                     │
+│ │ │                                                                 │
+└─┼─┼─────────────────────────────────────────────────────────────────┘
+  │ │                                                                  
+  │ │                OpenTelemetry Collector Pipeline                                                                                   
+  │ │                                                                  
+  │ │    Receivers               Processors               Exporters    
+  │ │ ┌────────────────┐       ┌─────────────┐        ┌───────────────┐
+  │ │ │ ┌──────┐       │       │ ┌─────────┐ │        │   ┌──────┐    │
+  └─┼─┼►│ OLTP │       │       │ │Filtering│ │   ┌───►│   │ OLTP │    │
+    │ │ └──────┘       │       │ └────┬────┘ │   │    │   └──────┘    │
+    │ │                │       │      │      │   │    │               │
+    │ │ ┌───────┐      │       │ ┌────▼────┐ │   │    │   ┌──────┐    │
+    └─┼►│ Jaeger│      ├──────►│ │Redaction│ ├───┼───►│   │Jaeger│    │
+      │ └───────┘      │       │ └────┬────┘ │   │    │   └──────┘    │
+      │                │       │      │      │   │    │               │
+      │ ┌────────────┐ │       │ ┌────▼────┐ │   │    │ ┌───────────┐ │
+      │ │ Prometheus │ │       │ │Batching │ │   └───►│ │ Promethus │ │
+      │ └────────────┘ │       │ └─────────┘ │        │ └───────────┘ │
+      │    ...         │       │    ...      │        │    ...        │
+      └────────────────┘       └─────────────┘        └───────────────┘
+
+Let's revisit how asp.net create an activity for incoming request:
+
+`HostingApplication` creates `HttpContext`  
+                    🠋
+calls `HostingApplicationDiagnostics.BeginRequest(httpContext, ...)`
+                    🠋 does two things in order
+a. `_activitySource(of "Microsoft.AspNetCore").CreateActivity("Microsoft.AspNetCore.Hosting.HttpRequestIn", ActivityKind.Server, context)` **which calls `TracerProviderSdk.listener`'s Sampler** (check important note below) ─►  `TracerProviderSdk.listener`'s delegate `ActivityListener.ActivityStarted` is invoked ─► `compositeProcessor?.OnStart(activity)` (normally `OnStart` does nothing)
+
+b. `diagnosticSource(of "Microsoft.AspNetCore").Write("Microsoft.AspNetCore.Hosting.BeginRequest", new DeprecatedRequestData(httpContext, startTimestamp))`
+  ─►  `HttpInListener.OnEventWritten(OnStartEvent)` (mainly to enrich the activity created above by calling multiple activity.SetTag(...))
+                    🠋
+
+`HostingApplication` calls Middlewares wrapped `RequestDelegate` ─► calls `HostingApplication.DisposeContext()` is called after Http request ends,  which calls  `HostingApplicationDiagnostics.RequestEnd(httpContext, ...)` 
+                    🠋
+
+a. `diagnosticSource(of "Microsoft.AspNetCore").Write("Microsoft.AspNetCore.Hosting.EndRequest", new DeprecatedRequestData(httpContext, currentTimestamp))`
+ ─► `HttpInListener.OnEventWritten(OnStopActivity)` (mainly to enrich the activity created above by calling multiple tags e.g `activity.SetTag("http.response.status_code", "200")`)
+
+b. `HostingApplicationDiagnostics.StopActivity(httpContext,  activity, ...)` is called to stop the current activity
+   ─►  `TracerProviderSdk.listener`'s delegate `ActivityListener.ActivityStopped` is invoked ─► `compositeProcessor?.OnEnd(activity)` (normally `BatchExportProcessor` is involved to batch each single activity into a batch)
+   ─► `OtlpTraceExporter` or `JaegerExporter` receives activityBatch and do a for loop to transform each activity to Otlp-format protobuf/Jaeger-format span
+
+check samd to see how `activity.IsAllDataRequested` and `activity.ActivityTraceFlags` being set when sampling result is `SamplingDecision.Drop`, `SamplingDecision.RecordOnly` and `SamplingDecision.RecordAndSample`
+
+also note a funny fact, even a HTTP request's trace-flags (sampling bit) is passed, the downstream service will still run the sampler, it is there when sampling bit is checked, the process is different to what you might think that why not just don't run sampler at all when it is sampled out, but asp.net wants to give you granular control on overall process so it still run sampler which you can add different logic there
+
+**it is important to note: `TracerProviderSdk.listener.Sample` is called inside `ActivitySource.CreateActivity()`**, the `SamplingDecision` will be mapped to e.g. `ActivitySamplingResult` so that when `Activity.Create(..., ActivitySamplingResult samplingResult, ...)` is called (inside `ActivitySource.CreateActivity()`), the samplingResult will be used to initialize the newly create Activity's `IsAllDataRequested` and  `ActivityTraceFlags`, so that when the Activity is started, `TracerProviderSdk.listener.ActivityStarted()` runs first, when sends Activity to `processor.OnStart(activity)` (note that processor's OnStart normally does nothing), which means that process firstly received an unenriched activity (see procenrih), then `HttpInListener.OnStartActivity()` runs, again `Activity.IsAllDataRequested` can influence its `EnrichWithHttpRequest`
+
+let's compare it with the stop of an activity, you will see why it has to be like this order and why stopping an activity is different than the starting an activity
+
+```C#
+internal sealed class HostingApplicationDiagnostics
+{
+    // ...
+    public void BeginRequest(HttpContext httpContext, HostingApplication.Context context) 
+    {
+        if (loggingEnabled || diagnosticListenerActivityCreationEnabled || _activitySource.HasListeners())
+        {
+            context.Activity = StartActivity(httpContext, loggingEnabled, diagnosticListenerActivityCreationEnabled, out var hasDiagnosticListener);  
+            // ...
+        }
+ 
+        if (diagnosticListenerEnabled)
+        {
+            if (_diagnosticListener.IsEnabled(DeprecatedDiagnosticsBeginRequestKey)) 
+            {
+                // ...
+                RecordBeginRequestDiagnostics(httpContext, startTimestamp);  // trigger HttpInListener.OnStartActivity()
+            }
+        }
+    }
+
+    public void RequestEnd(HttpContext httpContext, Exception? exception, HostingApplication.Context context)
+    {
+        // ...
+        if (_diagnosticListener.IsEnabled())
+        {
+             RecordEndRequestDiagnostics(httpContext, currentTimestamp);  // trigger HttpInListener.OnStopActivity()
+        }
+
+         var activity = context.Activity;
+        // Always stop activity if it was started
+        if (activity is not null)
+        {
+            StopActivity(httpContext, activity, context.HasDiagnosticListener);
+        }
+        // ...
+    }
+}
+```
+you can see that for BeginRequest, `StartActivity` calls before `RecordBeginRequestDiagnostics`, while for RequestEnd, the order is different, `RecordEndRequestDiagnostics` get called before `StopActivity`, that why the process.OnStart received an unenriched acitivity while process.OnEnd will received an full enriched acitivity.
+
+
+Another question is why we need `HttpInListener` when we already can use `TracerProviderSdk.listener` can react when activity is started? The reason is `HttpInListener` can recieve both `Activity` and `HttpContext`, you can further enrich the activity with HttpContext, for example, don't enrich activity is the http request is a static file request
+
+
 ## W3C Trace Context
 
 `traceparent: {version}-{trace-id}-{parent-span-id}-{sampling-state}`
@@ -134,415 +290,180 @@ see pact and cact how parentActivity's context passed to childActivity.
 Service A ──►  b3: abc123-11111111-1 ──► Service B ──► abc123-22222222-1-11111111 ──► Service C ──► abc123-33333333-1-22222222 ──► Downstream Services
 
 
-==================================================================================================================================================================
+
+## Sampling
+
+* `Head-based` Sampling
+
+The creation of `Activity` depends on the sampler's rule, keep or drop a trace is made at the very beginning of the trace
+
+* Tail-based Sampling
+
+You don't use any sampler in .net project and export all traces to OpenTelemetry Collector and configure sampling there.
+
+So unless state explicitly, we are talking about Head-based Sampling.
+
+`Consistent sampling` means that all spans in a trace are either all sampled in or all sampled out—there are no "partial traces" where only some spans are recorded. For example `ParentBasedSampler`  achieve consistent sampling as it use trace id for sampling decision, so all child spans in downstream services will have the same sampling result because same traice id is passed to all downstream services. `ParentBasedSampler` check the parent's activity context's trace-flags `-00` (sampled out) or `-01` (sampled in)
+
+
+let's walkthroug how ParentBasedSampler works in details:
+
 ```C#
-public static class Sdk
+void ConfigureParentBasedSampler(WebApplicationBuilder builder)
 {
-    public static TracerProviderBuilder CreateTracerProviderBuilder() => new TracerProviderBuilderBase();
-
-    // ...
-}
-
-public class TracerProviderBuilderBase : TracerProviderBuilder, ITracerProviderBuilder
-{
-    private readonly bool allowBuild;
-    private readonly TracerProviderServiceCollectionBuilder innerBuilder;
-
-    public override TracerProviderBuilder AddInstrumentation<TInstrumentation>(Func<TInstrumentation> instrumentationFactory)
-    {
-        this.innerBuilder.AddInstrumentation(instrumentationFactory);
-
-        return this;
-    }
-
-    public override TracerProviderBuilder AddSource(params string[] names)
-    {
-        this.innerBuilder.AddSource(names);
-
-        return this;
-    }
-
-    protected TracerProvider Build()  // <-------------------------------
-    {
-        // ...
-        var serviceProvider = services.BuildServiceProvider(validateScopes);
-
-        return new TracerProviderSdk(serviceProvider, ownsServiceProvider: true);
-    }
-
-    // ...
-}
-
-internal sealed class TracerProviderSdk : TracerProvider
-{
-    internal readonly IServiceProvider ServiceProvider;
-    internal readonly IDisposable? OwnedServiceProvider;
-    internal int ShutdownCount;
-    internal bool Disposed;
-
-    private readonly List<object> instrumentations = new();
-    private readonly ActivityListener listener;  // <----------------------------------
-    private readonly Sampler sampler;
-    private readonly Action<Activity> getRequestedDataAction;
-    private readonly bool supportLegacyActivity;
-    private BaseProcessor<Activity>? processor;
-
-    internal TracerProviderSdk(IServiceProvider serviceProvider, bool ownsServiceProvider)
-    {
-        // ...
-        var listener = new ActivityListener();  // <-------------------------------------
-
-        listener.ActivityStarted = activity =>
-        {
-            OpenTelemetrySdkEventSource.Log.ActivityStarted(activity);
-
-            if (activity.IsAllDataRequested && SuppressInstrumentationScope.IncrementIfTriggered() == 0)
-            {
-                this.processor?.OnStart(activity);
-            }
-        };
-
-        listener.ActivityStopped = activity =>
-        {
-            OpenTelemetrySdkEventSource.Log.ActivityStopped(activity);
-
-            if (!activity.IsAllDataRequested)
-            {
-                return;
-            }
-
-            if (SuppressInstrumentationScope.DecrementIfTriggered() == 0)
-            {
-                this.processor?.OnEnd(activity);
-            }
-        };
-
-        ActivitySource.AddActivityListener(listener);  // <----------------------------------
-        this.listener = listener;
-    }
+    builder.Services.AddOpenTelemetry()
+        .WithTracing(tp => tp
+            .SetSampler(new ParentBasedSampler(new TraceIdRatioBasedSampler(0.2)))  // AlwaysOffSampler is the root Sampler
+            .AddOtlpExporter());
 }
 ```
+0. Our WebApp (`w1`) starts, the request to /index is processed by asp.net, the w1 uses HttpClient to call a downstream microservice (`d1`)
+1.  `DiagnosticsHandler.SendAsyncCore` calls `s_activitySource.StartActivity("System.Net.Http..HttpRequestOut", ActivityKind.Client);` which creates `new ActivityCreationOptions<ActivityContext>` based on `Activity.Current`, then the Sample delegate of the activityListener created in `TracerProviderSdk` will be called with the ActivityCreationOptions instance (contains trace id), so `ParentBasedSampler.ShouldSample(new SamplingParameters(cctivityCreationOptions.Parent, options.TraceId, ...))` will be called
+via `TracerProviderSdk.ComputeActivitySamplingResult`. Only after Sampler's ShouldSample being called, an Activity instance (`actw1`, `new Activity("System.Net.Http.HttpRequestOut")`) is created depending on the SamplingResult (note that **Sampler's ShouldSample() is called before Activity instance creation**), if it is:
 
+a. `SamplingDecision.Drop` can maps to:
+   `ActivitySamplingResult.None`: no Activity/span will be created (unless it is root span or remote span)
+   `ActivitySamplingResult.PropagationData`: for root span or remote span, only collect TraceId and SpanId, NOT tags, baggage etc
+b. `SamplingDecision.RecordOnly` maps to `ActivitySamplingResult.AllData`: tags, baggage will be collected, NOT marked as sampled
+c. `SamplingDecision.RecordAndSample` maps to `ActivitySamplingResult.AllDataAndRecorded`: above plus marked as sampled, will be exported to tracing backend
 
-## Source Code
-
-```C#
-//-------------------V
-public class Activity : IDisposable  // In .NET world, a span is represented by an Activity
-{
-    public Activity(string operationName);
-
-	 public static Activity? Current { get; set; }
-	 public static ActivityIdFormat DefaultIdFormat { get; set; }
-	 public static bool ForceDefaultIdFormat { get; set; }
-	 public IEnumerable<KeyValuePair<string, object?>> TagObjects { get; }
-	 public ActivityTraceId TraceId { get; }
-	 public string? Id { get; }
-	 public bool IsAllDataRequested { get; set; }
-	 public ActivityIdFormat IdFormat { get; }
-	 public ActivityKind Kind { get; }
-	 public string OperationName { get; }
-	 public string DisplayName { get; set; }
-	 public IEnumerable<ActivityEvent> Events { get; }
-	 public ActivitySource Source { get; }
-	 public IEnumerable<ActivityLink> Links { get; }
-	 public ActivitySpanId ParentSpanId { get; }
-	 public bool Recorded { get; }
-	 public string? RootId { get; }
-	 public ActivitySpanId SpanId { get; }
-	 public DateTime StartTimeUtc { get; }
-	 public IEnumerable<KeyValuePair<string, string?>> Tags { get; }
-	 public Activity? Parent { get; }
-	 public string? ParentId { get; }
-    public TimeSpan Duration { get; }
-	 public IEnumerable<KeyValuePair<string, string?>> Baggage { get; }
-	 public string? TraceStateString { get; set; }
-	 public ActivityContext Context { get; }
-    public ActivityTraceFlags ActivityTraceFlags { get; set; }
-
-	 public Activity AddBaggage(string key, string? value);
-    public Activity AddEvent(ActivityEvent e);
-	 public Activity AddTag(string key, string? value);
-	 public Activity AddTag(string key, object? value);
-	 public string? GetBaggageItem(string key);
-	 public object? GetCustomProperty(string propertyName);
-	 public void SetCustomProperty(string propertyName, object? propertyValue);
-	 public Activity SetEndTime(DateTime endTimeUtc);
-	 public Activity SetIdFormat(ActivityIdFormat format);
-	 public Activity SetParentId(string parentId);
-	 public Activity SetParentId(ActivityTraceId traceId, ActivitySpanId spanId, ActivityTraceFlags activityTraceFlags = ActivityTraceFlags.None);
-	 public Activity SetStartTime(DateTime startTimeUtc);
-	 public Activity SetTag(string key, object? value);
-	 public Activity Start();
-	 public void Stop();
-}
-//-------------------Ʌ 
-```
+2. says the `actw1` is sampled in, in `d1`, `HostingApplicationDiagnostics` is determining whether to create an Activity instance, note that the decision is delegated to `ActivitySource.CreateActivity()` who will use Sampler like `ParentBasedSampler` to check the trace flags of parent Activity, since parent activity is sampled in and reflected by the 
+trace flags (ptf), so this soon-to-be child activity span will be created with "sampled-in" trace flag `-01` so that next downstream service can honour the the sampled in decision on and on again
 
 ```C#
-//--------------------------------V
-public sealed class ActivitySource : IDisposable
+public sealed class ParentBasedSampler : Sampler
 {
-    private static readonly SynchronizedList<ActivitySource> s_activeSources = new SynchronizedList<ActivitySource>();     // <-------------------static
-    private static readonly SynchronizedList<ActivityListener> s_allListeners = new SynchronizedList<ActivityListener>();  // <-------------------static
-    private SynchronizedList<ActivityListener>? _listeners;  // <--------------non static listener
-    
-    public ActivitySource(string name, string? version = "")
+    private readonly Sampler rootSampler;
+
+    private readonly Sampler remoteParentSampled;
+    private readonly Sampler remoteParentNotSampled;
+    private readonly Sampler localParentSampled;
+    private readonly Sampler localParentNotSampled;
+
+    public ParentBasedSampler(Sampler rootSampler)
     {
-        Name = name ?? throw new ArgumentNullException(nameof(name));
-        Version = version;
- 
-        s_activeSources.Add(this);  // <------------------------add itself
- 
-        if (s_allListeners.Count > 0)
+        this.rootSampler = rootSampler;
+        this.Description = $"ParentBased{{{rootSampler.Description}}}";
+
+        this.remoteParentSampled = new AlwaysOnSampler();
+        this.remoteParentNotSampled = new AlwaysOffSampler();
+        this.localParentSampled = new AlwaysOnSampler();  // <-----------------
+        this.localParentNotSampled = new AlwaysOffSampler();
+    }
+
+    public ParentBasedSampler(Sampler rootSampler, Sampler? remoteParentSampled = null, Sampler? remoteParentNotSampled = null, Sampler? localParentSampled = null,  Sampler? localParentNotSampled = null) : this(rootSampler)
+    {
+        this.remoteParentSampled = remoteParentSampled ?? new AlwaysOnSampler();
+        this.remoteParentNotSampled = remoteParentNotSampled ?? new AlwaysOffSampler();
+        this.localParentSampled = localParentSampled ?? new AlwaysOnSampler();
+        this.localParentNotSampled = localParentNotSampled ?? new AlwaysOffSampler();
+    }
+
+    public override SamplingResult ShouldSample(in SamplingParameters samplingParameters)
+    {
+        var parentContext = samplingParameters.ParentContext;
+        if (parentContext.TraceId == default)
         {
-            s_allListeners.EnumWithAction((listener, source) =>
-            {
-                Func<ActivitySource, bool>? shouldListenTo = listener.ShouldListenTo;
-                if (shouldListenTo != null)
-                {
-                    var activitySource = (ActivitySource)source;
-                    if (shouldListenTo(activitySource))
-                    {
-                        activitySource.AddListener(listener);  // <-------------------------
-                    }
-                }
-            }, this);
+            // If no parent, use the rootSampler to determine sampling.
+            return this.rootSampler.ShouldSample(samplingParameters);
         }
- 
-        GC.KeepAlive(DiagnosticSourceEventSource.Log);
-    }
-
-	public string Name { get; }
-	public string? Version { get; }
-
-	public static void AddActivityListener(ActivityListener listener)  // <-----------------------------static
-    {
-        if (s_allListeners.AddIfNotExist(listener))
+      
+        // <---------------------check soon-to-be created activity's sampled bit, check samd to see further action on the SamplingResult
+        if ((parentContext.TraceFlags & ActivityTraceFlags.Recorded) != 0)  // <--------------------------- ptf, when parent is sampled
         {
-            s_activeSources.EnumWithAction((source, obj) => {
-                var shouldListenTo = ((ActivityListener)obj).ShouldListenTo;
-                if (shouldListenTo != null && shouldListenTo(source))
-                {
-                    source.AddListener((ActivityListener)obj);
-                }
-            }, listener);
+            if (parentContext.IsRemote)
+                return this.remoteParentSampled.ShouldSample(samplingParameters);
+            else
+                return this.localParentSampled.ShouldSample(samplingParameters);  // localParentSampled is AlwaysOnSampler by default
+        }
+
+        // If parent is not sampled => delegate to the "not sampled" inner samplers.
+        if (parentContext.IsRemote)
+            return this.remoteParentNotSampled.ShouldSample(samplingParameters);
+        else
+            return this.localParentNotSampled.ShouldSample(samplingParameters);
+    }
+}
+```
+
+if you see `TraceIdRatioBasedSampler`usage like:
+
+```C#
+void ConfigureProbabilitySampler(WebApplicationBuilder builder)
+{
+    builder.Services.AddOpenTelemetry()
+        .WithTracing(tp => tp
+            .SetSampler(new TraceIdRatioBasedSampler(0.2))
+            .AddOtlpExporter());
+}
+```
+
+you might ask how can child activity and parent activity be consistent, how can it prevent parent activity sampled in but child activity sampled out since the ratio means random, but this won't happen because `TraceIdRatioBasedSampler` purely use trace id to calculate the probability, since trace id is passed from parent activity to child activity, so the decisions alwasy match, i.e if parent activity is sampled in then child activities are also sampled in. So the only thing decide the final sampling decision is the trace id genereated by the parent activiy in the first place.
+
+
+
+## Processor
+
+Sometimes you want to drop some activities e.g  those that represent retrieving static files, there are two options
+
+Option1: Dropping them in the processor
+
+```C#
+Builder.Services.AddOpenTelemetry()
+    .WithTracing(builder => builder
+    .AddProcessor<StaticFilesFilteringProcessor>()  // <--------------execute first
+    .AddProcessor<XXXProcessor>()                   // <--------------execute later, all the processors are wrapped in CompositeProcessor
+    // ...
+);
+
+public class StaticFilesFilteringProcessor : BaseProcessor<Activity> 
+{   
+    public override void OnEnd(Activity activity)
+    {
+        if (activity.Kind == ActivityKind.Server && activity.GetTagItem("http.method") as string == "GET" && activity.GetTagItem("http.route") == null)
+        {
+            activity.ActivityTraceFlags &= ~ActivityTraceFlags.Recorded;   // make BatchActivityExportProcessor.OnEnd() "drop" the activity
         }
     }
 
-	public bool HasListeners();
-
-	public Activity? StartActivity(string name, ActivityKind kind = ActivityKind.Internal);
-	public Activity? StartActivity(string name, ActivityKind kind, ActivityContext parentContext,  IEnumerable<KeyValuePair<string, object?>>? tags = null,                   
-	                               IEnumerable<ActivityLink>? links = null, DateTimeOffset startTime = default);
-	public Activity? CreateActivity(string name, ActivityKind kind) => CreateActivity(name, kind, default, null, null, null, default, startIt: false);
-	private Activity? CreateActivity(string name, ActivityKind kind, ActivityContext context, string? parentId, IEnumerable<KeyValuePair<string, object?>>? tags,
-                                    IEnumerable<ActivityLink>? links, DateTimeOffset startTime, bool startIt = true, ActivityIdFormat idFormat = ActivityIdFormat.Unknown)
+    /* you cannot put the code in OnStart, because when activity is started, the request pipeline hasn't started yet, so you have to wail until
+       request pipeline finsihed, which is OnEnd to be able to access activity.GetTagItem("http.route")
+    public override void OnStart(Activity activity)
+    { 
+        if (activity.Kind == ActivityKind.Server && activity.GetTagItem("http.method") as string == "GET" && activity.GetTagItem("http.route") == null)
+            activity.ActivityTraceFlags &= ~ActivityTraceFlags.Recorded;
+    }
+    */
 }
-//--------------------------------Ʌ
+// to see why use activity.GetTagItem("http.route") == null, check stf
 
-//------------------------------------V
-public readonly struct ActivityTraceId : IEquatable<ActivityTraceId>
+public class BatchActivityExportProcessor : BatchExportProcessor<Activity>  // normally it is the last processor
 {
-	public static ActivityTraceId CreateFromBytes(ReadOnlySpan<byte> idData);
-	public static ActivityTraceId CreateFromString(ReadOnlySpan<char> idData);
-	public static ActivityTraceId CreateFromUtf8String(ReadOnlySpan<byte> idData);
-	public static ActivityTraceId CreateRandom();
-	public void CopyTo(Span<byte> destination);
-	public bool Equals(ActivityTraceId traceId);
+    public BatchActivityExportProcessor(BaseExporter<Activity> exporter, ...) : base(exporter, ...) { }
 
-	public static bool operator ==(ActivityTraceId traceId1, ActivityTraceId traceId2);
-	public static bool operator !=(ActivityTraceId traceId1, ActivityTraceId traceId2);
+    public override void OnEnd(Activity data)
+    {
+        if (!data.Recorded)  
+        {
+            return;
+        }
+
+        this.OnExport(data);  
+    }
 }
-//------------------------------------Ʌ
-
-//------------------------------------V
-public readonly struct ActivitySpanId : IEquatable<ActivitySpanId>
-{
-	private readonly string? _hexString;
-
-    internal ActivitySpanId(string? hexString) => _hexString = hexString;
-    
-    public static ActivitySpanId CreateFromBytes(ReadOnlySpan<byte> idData);
-	public static ActivitySpanId CreateFromString(ReadOnlySpan<char> idData);
-	public static ActivitySpanId CreateFromUtf8String(ReadOnlySpan<byte> idData);
-	public static ActivitySpanId CreateRandom();
-	public void CopyTo(Span<byte> destination);
-	public bool Equals(ActivitySpanId traceId);
-
-	public static bool operator ==(ActivitySpanId traceId1, ActivitySpanId traceId2);
-	public static bool operator !=(ActivitySpanId traceId1, ActivitySpanId traceId2);
-}
-//------------------------------------Ʌ
-
-//------------------------------------V
-public readonly struct ActivityContext : IEquatable<ActivityContext>
-{
-    public ActivityContext(ActivityTraceId traceId, ActivitySpanId spanId, ActivityTraceFlags traceFlags, string? traceState = null, bool isRemote = false);
-
-	public ActivityTraceId TraceId { get; }
-	public ActivitySpanId SpanId { get; }
-	public ActivityTraceFlags TraceFlags { get; }
-	public string? TraceState { get; }
-	public bool IsRemote { get; }
-
-	public static ActivityContext Parse(string traceParent, string? traceState);
-	public static bool TryParse(string traceParent, string? traceState, out ActivityContext context);
-	public bool Equals(ActivityContext value);
-    
-	public static bool operator ==(ActivityContext left, ActivityContext right);
-	public static bool operator !=(ActivityContext left, ActivityContext right);
-}
-//------------------------------------Ʌ
-
-//----------------------------------V
-public readonly struct ActivityEvent
-{
-    public ActivityEvent(string name);
-	public ActivityEvent(string name, DateTimeOffset timestamp = default, ActivityTagsCollection? tags = null);
-
-	public string Name { get; }
-	public DateTimeOffset Timestamp { get; }
-	public IEnumerable<KeyValuePair<string, object?>> Tags { get; }
-}
-//----------------------------------Ʌ
-
-//---------------------------------V
-public readonly struct ActivityLink : IEquatable<ActivityLink>
-{
-    public ActivityLink(ActivityContext context, ActivityTagsCollection? tags = null);
-
-	public ActivityContext Context { get; }
-    public IEnumerable<KeyValuePair<string, object?>>? Tags { get; }
-    public bool Equals(ActivityLink value);
-
-	public static bool operator ==(ActivityLink left, ActivityLink right);
-    public static bool operator !=(ActivityLink left, ActivityLink right);
-}
-//---------------------------------Ʌ
-
-//----------------------------------V
-public sealed class ActivityListener : IDisposable
-{
-    public ActivityListener();
-
-	public Action<Activity>? ActivityStarted { get; set; }
-	public Action<Activity>? ActivityStopped { get; set; }
-	public Func<ActivitySource, bool>? ShouldListenTo { get; set; }
-	public SampleActivity<string>? SampleUsingParentId { get; set; }
-	public SampleActivity<ActivityContext>? Sample { get; set; }
-
-	public delegate ActivitySamplingResult SampleActivity<T>(ref ActivityCreationOptions<T> options);
-}
-//----------------------------------Ʌ
-
-//-----------------------------------------------V
-public readonly struct ActivityCreationOptions<T>
-{
-    public ActivitySource Source { get; }
-	public string Name { get; }
-	public ActivityKind Kind { get; }
-	public T Parent { get; }
-	public IEnumerable<KeyValuePair<string, object?>>? Tags { get; }
-	public IEnumerable<ActivityLink>? Links { get; }
-	public ActivityTagsCollection SamplingTags { get; }
-	public ActivityTraceId TraceId { get; }
-}
-//-----------------------------------------------Ʌ
-
-//---------------------------------V
-public class ActivityTagsCollection : IDictionary<string, object?>, ICollection<KeyValuePair<string, object?>>, IEnumerable<KeyValuePair<string, object?>>, IEnumerable
-{
-    public ActivityTagsCollection();
-	public ActivityTagsCollection(IEnumerable<KeyValuePair<string, object?>> list);
-
-	public object? this[string key];
-	public bool IsReadOnly { get; }
-	public int Count { get; }
-	public ICollection<object?> Values { get; }
-	public ICollection<string> Keys { get; }
-
-	public void Add(string key, object? value);
-	public void Add(KeyValuePair<string, object?> item);
-	public bool Contains(KeyValuePair<string, object?> item);
-	public bool ContainsKey(string key);
-	public void Clear();
-	// ...
-}
-//---------------------------------Ʌ
-
-//----------------------V
-public enum ActivityKind
-{
-	Internal = 0,
-	Server = 1,
-	Client = 2,
-	Producer = 3,
-	Consumer = 4
-}
-//----------------------Ʌ
-
-//--------------------------V
-public enum ActivityIdFormat
-{
-	Unknown = 0,
-	Hierarchical = 1,
-	W3C = 2
-}
-//--------------------------Ʌ
-
-//----------------------------V
-public enum ActivityTraceFlags
-{
-	None = 0,
-	Recorded = 1
-}
-//----------------------------Ʌ
 ```
 
+Option2: Prevent Activity being record by setting ` activity.ActivityTraceFlags &= ~ActivityTraceFlags.Recorded` in the first place rather than in custom's processor via `AspNetCoreInstrumentationOptions.Filter`
 
+```C#
+Builder.Services.AddOpenTelemetry()
+    .WithTracing(builder => builder
+    .AddAspNetCoreInstrumentation(o => o.Filter = ctx => !IsStaticFile(ctx.Request.Path))  // <--------see ofl, 
+    // ...
+);
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+static bool IsStaticFile(PathString requestPath) => requestPath.HasValue && (requestPath.Value.EndsWith(".js") ||  requestPath.Value.EndsWith(".css"));
+```
 
 
 

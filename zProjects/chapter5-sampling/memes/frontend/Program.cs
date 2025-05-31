@@ -86,7 +86,5 @@ static void ConfigureTelemetry(WebApplicationBuilder builder)
 
 static bool IsStaticFile(PathString requestPath)
 {
-    return requestPath.HasValue && requestPath.HasValue &&
-        (requestPath.Value.EndsWith(".js") || 
-         requestPath.Value.EndsWith(".css"));
+    return requestPath.HasValue && (requestPath.Value.EndsWith(".js") || requestPath.Value.EndsWith(".css"));
 }

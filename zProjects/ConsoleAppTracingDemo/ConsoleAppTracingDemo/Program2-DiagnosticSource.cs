@@ -38,10 +38,10 @@ namespace DiagnosticSourceSample
                 listener.Subscribe(new MyLibraryListener()!);
             }
 
-            //if (listener.Name == "HttpHandlerDiagnosticListener")
-            //{
-            //    listener.Subscribe(new HttpClientObserver()!);
-            //}
+            if (listener.Name == "HttpHandlerDiagnosticListener")
+            {
+                listener.Subscribe(new HttpClientObserver()!);
+            }
         }
     }
 

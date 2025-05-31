@@ -20,7 +20,7 @@ namespace WeatherForecastSimpleTracing
                     {
                         opt.EnrichWithHttpRequest = (activity, httpRequest) =>
                         {
-                            activity.SetTag("myTags.count", 0);
+                            activity.SetTag("myTags.count", 2025);
                             activity.SetTag("myTags.method", httpRequest.Method);
                             activity.SetTag("myTags.url", httpRequest.Path);
                             activity.SetBaggage("UserId", "1234");

@@ -5,12 +5,12 @@ namespace ConsoleAppTracingDemo
     class Program
     {
         private static readonly ActivitySource ActivitySource = new ActivitySource("DemoApp.Tracing");
-        static void Main(string[] args)
+        static void Mainz(string[] args)
         {
             using var listener = new ActivityListener
             {
                 ShouldListenTo = source => source.Name == "DemoApp.Tracing", // listen only to our ActivitySource
-                Sample = (ref ActivityCreationOptions<ActivityContext> options) => ActivitySamplingResult.AllDataAndRecorded,
+                Sample = (ref ActivityCreationOptions<ActivityContext> options) => ActivitySamplingResult.AllData,
                 ActivityStarted = activity => Console.WriteLine($"Activity Started: {activity.DisplayName}"),
                 ActivityStopped = activity =>
                 {
@@ -26,6 +26,9 @@ namespace ConsoleAppTracingDemo
 
             using (Activity parentActivity = ActivitySource.StartActivity("ParentActivity")!)   // start a parent activity, its internal ActivityContext is null,  check dlrspecial
             {
+                parentActivity.SetTag("myTags", "this is it");
+                parentActivity.SetBaggage("UserId", "1234");
+
                 parentActivity.SetTag("rootTag", "This is the root activity.");    // set some additional information on the root activity
 
                 Console.WriteLine($"  RA Id: {parentActivity.Id}");

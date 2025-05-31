@@ -10,24 +10,42 @@ public class Program
             .AddOpenTelemetry()
             .WithTracing(builder =>  // builder is TracerProviderBuilder
                 builder
-                .AddAspNetCoreInstrumentation(opt =>   // <------------add listener(HttpInListener) for ActivitySource("Microsoft.AspNetCore") 
-                {
-                    opt.EnrichWithHttpRequest = (activity, httpRequest) =>  // opt is AspNetCoreTraceInstrumentationOptions
+                .AddAspNetCoreInstrumentation(opt =>   // <------------!important add listener(`HttpInListener`) for ActivitySource("Microsoft.AspNetCore") 
+                {                 
+                    opt.EnrichWithHttpRequest = (activity, httpRequestMessage) =>  // opt is AspNetCoreTraceInstrumentationOptions, // <-----------see ehr
                     {
-                        activity.SetTag("myTags.method", httpRequest.Method);
-                        activity.SetTag("myTags.url", httpRequest.Path);
+                        activity.SetTag("myTags.method", httpRequestMessage.Method);
+                        activity.SetTag("myTags.url", httpRequestMessage.Path);
                         activity.SetBaggage("UserId", "1234");
                     };
+                               
+                    opt.Filter = httpContext => !IsStaticFile(httpContext.Request.Path)
                 })
-                .AddHttpClientInstrumentation() // <-------------------add listener(HttpHandlerDiagnosticListener) for ActivitySource("System.Net.Http") 
+                //.SetSampler(new ParentBasedSampler(new AlwaysOnSampler()))  <-----------------------this is the default sampler if you don't specify one
+                .AddProcessor<MemeNameEnrichingProcessor>()  // AddOtlpExporter uses its own processor,  MemeNameEnrichingProcessor is registered first, it will be called first
+                .AddHttpClientInstrumentation(options =>  // <-------------------!important add listener(`HttpHandlerDiagnosticListener`) for ActivitySource("System.Net.Http") 
+                {
+                    options.EnrichWithHttpRequestMessage = (act, httpRequestMessage) => 
+                    {
+                        if (httpRequestMessage.Options.TryGetValue(new HttpRequestOptionsKey<int>("try"), out var tryCount) && tryCount > 0)
+                            act.SetTag("http.resend_count", tryCount);
+
+                        act.SetTag("http.request_content_length", httpRequestMessage.Content?.Headers.ContentLength);
+                    };
+
+                    options.EnrichWithHttpResponseMessage = (activity, httpResponseMessage) =>  // response is HttpResponseMessage
+                        activity.SetTag("http.response_content_length", httpResponseMessage.Content.Headers.ContentLength);
+
+                    options.RecordException = true;
+                })
                 .AddConsoleExporter()
-                .SetResourceBuilder(ResourceBuilder.CreateDefault().AddService("App1"))
+                .SetResourceBuilder(ResourceBuilder.CreateDefault().AddService("App1"))             
                 .AddOtlpExporter(opts =>  // opts is OtlpExporterOptions
                 {
                     opts.Protocol = OtlpExportProtocol.Grpc;  // no really need to set it as by default OTLP over gRPC, setting the protocol explicitly is a good practice
                     opts.Endpoint = new Uri("http://localhost:4317");  // port 4317 is OpenTelemetry Collector's gRPC receiver, need OpenTelemetry Collector as separate process
                                                                        // e.g using docker with image otel/opentelemetry-collector:latest
-                })
+                })  // AddOtlpExporter uses BatchActivityExportProcessor
                 /*
                 .AddJaegerExporter(opts =>
                 {
@@ -38,7 +56,7 @@ public class Program
                 .AddJaegerExporter(opts =>
                 {
                     opts.Protocol = JaegerExportProtocol.Grpc;
-                    opts.Endpoint = new Uri("http://jaeger.mydomain.local:14250"); // bypass OpenTelemetry Collector, send tracs to Jaeger directly
+                    opts.Endpoint = new Uri("http://jaeger.mydomain.local:14250"); // bypass OpenTelemetry Collector, send traces to Jaeger directly
                 })
                 */
                 .AddSource("Tracing.NET")  // <----------------- check acts to see how ActivityListener in tpsact can use this setting
@@ -47,10 +65,31 @@ public class Program
 
     /*
        port 4317 is OpenTelemetry Collector's gRPC receiver
-       port 14268 is jaeger's collector on HTTP
+       port 14268 is OpenTelemetry jaeger's collector on HTTP
     */
 }
 ```
+
+```C#
+class MemeNameEnrichingProcessor : BaseProcessor<Activity>
+{
+    public override void OnEnd(Activity activity)
+    {
+        var name = GetName(activity);
+        if (name != null) 
+            activity.SetTag("meme_name", name);
+    }
+
+    private string? GetName(Activity activity)
+    {
+        if (Baggage.Current.GetBaggage().TryGetValue("meme_name", out var name)) 
+            return name;
+
+        return activity.GetBaggageItem("meme_name");
+    }
+}
+```
+
 ```C#
 public class WeatherForecastController : ControllerBase
 {
@@ -1046,7 +1085,7 @@ public static class AspNetCoreInstrumentationTracerProviderBuilderExtensions
         {
             var options = sp.GetRequiredService<IOptionsMonitor<AspNetCoreTraceInstrumentationOptions>>().Get(name);
 
-            return new AspNetCoreInstrumentation(new HttpInListener(options));
+            return new AspNetCoreInstrumentation(new HttpInListener(options));  // <----------------------------hil
         });
     }
 
@@ -1253,6 +1292,7 @@ internal sealed class AspNetCoreInstrumentation : IDisposable
 
     public AspNetCoreInstrumentation(HttpInListener httpInListener)
     {
+        // <----------------------------hil
         this.diagnosticSourceSubscriber = new DiagnosticSourceSubscriber(httpInListener, this.isEnabled, AspNetCoreInstrumentationEventSource.Log.UnknownErrorProcessingEvent);
         this.diagnosticSourceSubscriber.Subscribe();
     }
@@ -1479,7 +1519,6 @@ internal class HttpInListener : ListenerHandler
     internal const string OnUnhandledHostingExceptionEvent = "Microsoft.AspNetCore.Hosting.UnhandledException";
     internal const string OnUnHandledDiagnosticsExceptionEvent = "Microsoft.AspNetCore.Diagnostics.UnhandledException";
 
-    // https://github.com/dotnet/aspnetcore/blob/8d6554e655b64da75b71e0e20d6db54a3ba8d2fb/src/Hosting/Hosting/src/GenericHost/GenericWebHostBuilder.cs#L85
     internal const string AspNetCoreActivitySourceName = "Microsoft.AspNetCore";
 
     internal static readonly AssemblyName AssemblyName = typeof(HttpInListener).Assembly.GetName();
@@ -1510,9 +1549,9 @@ internal class HttpInListener : ListenerHandler
         this.options = options;
     }
 
-    public override void OnEventWritten(string name, object? payload)
+    public override void OnEventWritten(string name, object? payload)  // <--------------hil
     {
-        var activity = Activity.Current!;
+        var activity = Activity.Current!;  // <---------------------
 
         switch (name)
         {
@@ -1540,7 +1579,7 @@ internal class HttpInListener : ListenerHandler
         }
     }
 
-    public void OnStartActivity(Activity activity, object? payload)
+    public void OnStartActivity(Activity activity, object? payload)  // <-------------------hil, see the counterpart at dlr3.4
     {
         // The overall flow of what AspNetCore library does is as below:
         // Activity.Start()
@@ -1572,8 +1611,7 @@ internal class HttpInListener : ListenerHandler
                 Activity? newOne;
                 if (Net7OrGreater)
                 {
-                    // For NET7.0 onwards activity is created using ActivitySource so,
-                    // we will use the source of the activity to create the new one.
+                    // For NET7.0 onwards activity is created using ActivitySource so, we will use the source of the activity to create the new one.
                     newOne = activity.Source.CreateActivity(ActivityOperationName, ActivityKind.Server, ctx.ActivityContext);
                 }
                 else
@@ -1602,11 +1640,15 @@ internal class HttpInListener : ListenerHandler
         {
             try
             {
-                if (this.options.Filter?.Invoke(context) == false)
+                if (this.options.Filter?.Invoke(context) == false)  // <--------------hil, ofl
                 {
                     AspNetCoreInstrumentationEventSource.Log.RequestIsFilteredOut(nameof(HttpInListener), nameof(this.OnStartActivity), activity.OperationName);
                     activity.IsAllDataRequested = false;
-                    activity.ActivityTraceFlags &= ~ActivityTraceFlags.Recorded;
+                    activity.ActivityTraceFlags &= ~ActivityTraceFlags.Recorded;  // <-------------hil, Fiter can even change the sampling bits, which make senses
+                                                                                  // but since it changes the original activity, shouldn't it a small chance/race that
+                                                                                  // a child activity will be created and sampled in and pass to downstream service?
+                                                                                  // well actully no, because this change sampling bits are like atomic operation becausse 
+                                                                                  // it executes right after HostingApplicationDiagnostics creates an activity
                     return;
                 }
             }
@@ -1660,7 +1702,7 @@ internal class HttpInListener : ListenerHandler
 
             try
             {
-                this.options.EnrichWithHttpRequest?.Invoke(activity, request);
+                this.options.EnrichWithHttpRequest?.Invoke(activity, request);  // <-------------------ehr
             }
             catch (Exception ex)
             {
@@ -1681,11 +1723,13 @@ internal class HttpInListener : ListenerHandler
 
             var response = context.Response;
 
+            // <-----------------stf, if the request is for a static file, then the request won't be processed by routing middleware, so routePattern will be null
             var routePattern = (context.Features.Get<IExceptionHandlerPathFeature>()?.Endpoint as RouteEndpoint ?? context.GetEndpoint() as RouteEndpoint)?.RoutePattern.RawText;
             if (!string.IsNullOrEmpty(routePattern))
             {
                 TelemetryHelper.RequestDataHelper.SetActivityDisplayName(activity, context.Request.Method, routePattern);
-                activity.SetTag(SemanticConventions.AttributeHttpRoute, routePattern);
+                activity.SetTag(SemanticConventions.AttributeHttpRoute, routePattern);  // <---------set tag:  http.route: /api/WeatherForecast/{city}
+                                                                                        
             }
 
             activity.SetTag(SemanticConventions.AttributeHttpResponseStatusCode, TelemetryHelper.GetBoxedStatusCode(response.StatusCode));
@@ -2237,8 +2281,8 @@ internal sealed class TracerProviderSdk : TracerProvider
     internal bool Disposed;
 
     private readonly List<object> instrumentations = [];
-    private readonly ActivityListener listener;
-    private readonly Sampler sampler;
+    private readonly ActivityListener listener; // <-------------------
+    private readonly Sampler sampler; // <-------------------
     private readonly Action<Activity> getRequestedDataAction;
     private readonly bool supportLegacyActivity;
     private BaseProcessor<Activity>? processor;
@@ -2246,7 +2290,7 @@ internal sealed class TracerProviderSdk : TracerProvider
     internal TracerProviderSdk(IServiceProvider serviceProvider, bool ownsServiceProvider)
     {
 
-        var state = serviceProvider!.GetRequiredService<TracerProviderBuilderSdk>();
+        TracerProviderBuilderSdk state = serviceProvider!.GetRequiredService<TracerProviderBuilderSdk>();
         state.RegisterProvider(this);
 
         this.ServiceProvider = serviceProvider!;
@@ -2343,7 +2387,7 @@ internal sealed class TracerProviderSdk : TracerProvider
                     if (legacyActivityPredicate(activity))
                     {
                         if (!Sdk.SuppressInstrumentation)
-                            this.getRequestedDataAction!(activity);
+                            this.getRequestedDataAction!(activity);  // <---------------------
                         else
                             activity.IsAllDataRequested = false;
                     }
@@ -2380,7 +2424,7 @@ internal sealed class TracerProviderSdk : TracerProvider
             {
                 OpenTelemetrySdkEventSource.Log.ActivityStarted(activity);
 
-                if (activity.IsAllDataRequested && SuppressInstrumentationScope.IncrementIfTriggered() == 0)
+                if (activity.IsAllDataRequested && ...)  // <---------------------! the activity won't be send to processor if IsAllDataRequested is false
                 {
                     this.processor?.OnStart(activity);
                 }
@@ -2390,14 +2434,14 @@ internal sealed class TracerProviderSdk : TracerProvider
             {
                 OpenTelemetrySdkEventSource.Log.ActivityStopped(activity);
 
-                if (!activity.IsAllDataRequested)
+                if (!activity.IsAllDataRequested)  //<--------------------------sam
                 {
                     return;
                 }
 
                 if (SuppressInstrumentationScope.DecrementIfTriggered() == 0)
                 {
-                    this.processor?.OnEnd(activity);
+                    this.processor?.OnEnd(activity);  // <--------------------------! send activity to processor
                 }
             };
         }
@@ -2458,7 +2502,7 @@ internal sealed class TracerProviderSdk : TracerProvider
             }
         }
 
-        ActivitySource.AddActivityListener(activityListener);  // <-------------------------
+        ActivitySource.AddActivityListener(activityListener);   // <--------------------------acts
         this.listener = activityListener;
         OpenTelemetrySdkEventSource.Log.TracerProviderSdkEvent("TracerProvider built successfully.");
     }
@@ -2619,14 +2663,15 @@ internal sealed class TracerProviderSdk : TracerProvider
 
     private static ActivitySamplingResult ComputeActivitySamplingResult(ref ActivityCreationOptions<ActivityContext> options, Sampler sampler)
     {
-        var samplingParameters = new SamplingParameters(options.Parent, options.TraceId, options.Name, options.Kind, options.Tags, options.Links);
+        var samplingParameters = new SamplingParameters(options.Parent, options.TraceId, options.Name, options.Kind, options.Tags, options.Links);  
 
-        var samplingResult = sampler.ShouldSample(samplingParameters);
+        SamplingResult samplingResult = sampler.ShouldSample(samplingParameters);  // <--------------sam
 
         var activitySamplingResult = samplingResult.Decision switch
         {
             SamplingDecision.RecordAndSample => ActivitySamplingResult.AllDataAndRecorded,
-            SamplingDecision.RecordOnly => ActivitySamplingResult.AllData, _ => PropagateOrIgnoreData(ref options),
+            SamplingDecision.RecordOnly => ActivitySamplingResult.AllData,
+            _ => PropagateOrIgnoreData(ref options),  // return ActivitySamplingResult.PropagationData for rootSpan or ActivitySamplingResult.None (when SamplingDecision.Drop)
         };
 
         if (activitySamplingResult > ActivitySamplingResult.PropagationData)
@@ -2688,7 +2733,7 @@ internal sealed class TracerProviderSdk : TracerProvider
 
         var samplingResult = this.sampler.ShouldSample(samplingParameters);
 
-        switch (samplingResult.Decision)
+        switch (samplingResult.Decision)  // <------------------samd
         {
             case SamplingDecision.Drop:
                 activity.IsAllDataRequested = false;
@@ -2732,6 +2777,169 @@ public enum SamplingDecision
                         // Activity.IsAllDataRequested will return true. Activity.Recorded will return true.            
 }
 //--------------------------Ʌ
+
+//----------------------------V
+public readonly struct Baggage : IEquatable<Baggage>
+{
+    private static readonly RuntimeContextSlot<BaggageHolder> RuntimeContextSlot = RuntimeContext.RegisterSlot<BaggageHolder>("otel.baggage");  // <------use AsyncLocal
+    private static readonly Dictionary<string, string> EmptyBaggage = [];
+
+    private readonly Dictionary<string, string> baggage;
+
+    internal Baggage(Dictionary<string, string> baggage)
+    {
+        this.baggage = baggage;
+    }
+
+    public static Baggage Current
+    {
+        get => RuntimeContextSlot.Get()?.Baggage ?? default;
+        set => EnsureBaggageHolder().Baggage = value;
+    }
+
+    public static bool operator ==(Baggage left, Baggage right) => left.Equals(right);
+
+    public static Baggage Create(Dictionary<string, string>? baggageItems = null)
+    {
+        if (baggageItems == null)
+        {
+            return default;
+        }
+
+        Dictionary<string, string> baggageCopy = new Dictionary<string, string>(baggageItems.Count, StringComparer.OrdinalIgnoreCase);
+        foreach (KeyValuePair<string, string> baggageItem in baggageItems)
+        {
+            if (string.IsNullOrEmpty(baggageItem.Value))
+            {
+                baggageCopy.Remove(baggageItem.Key);
+                continue;
+            }
+
+            baggageCopy[baggageItem.Key] = baggageItem.Value;
+        }
+
+        return new Baggage(baggageCopy);
+    }
+
+    public static IReadOnlyDictionary<string, string> GetBaggage(Baggage baggage = default) => baggage == default ? Current.GetBaggage() : baggage.GetBaggage();
+
+    public static Dictionary<string, string>.Enumerator GetEnumerator(Baggage baggage = default) => baggage == default ? Current.GetEnumerator() : baggage.GetEnumerator();
+
+    public static string? GetBaggage(string name, Baggage baggage = default) => baggage == default ? Current.GetBaggage(name) : baggage.GetBaggage(name);
+
+    public static Baggage SetBaggage(string name, string? value, Baggage baggage = default)
+    {
+        var baggageHolder = EnsureBaggageHolder();
+        lock (baggageHolder)
+        {
+            return baggageHolder.Baggage = baggage == default
+                ? baggageHolder.Baggage.SetBaggage(name, value)
+                : baggage.SetBaggage(name, value);
+        }
+    }
+
+    public static Baggage SetBaggage(IEnumerable<KeyValuePair<string, string?>> baggageItems, Baggage baggage = default)
+    {
+        var baggageHolder = EnsureBaggageHolder();
+        lock (baggageHolder)
+        {
+            return baggageHolder.Baggage = baggage == default
+                ? baggageHolder.Baggage.SetBaggage(baggageItems)
+                : baggage.SetBaggage(baggageItems);
+        }
+    }
+
+    public static Baggage RemoveBaggage(string name, Baggage baggage = default)
+    {
+        var baggageHolder = EnsureBaggageHolder();
+        lock (baggageHolder)
+        {
+            return baggageHolder.Baggage = baggage == default ? baggageHolder.Baggage.RemoveBaggage(name) : baggage.RemoveBaggage(name);
+        }
+    }
+
+    public static Baggage ClearBaggage(Baggage baggage = default)
+    {
+        var baggageHolder = EnsureBaggageHolder();
+        lock (baggageHolder)
+        {
+            return baggageHolder.Baggage = baggage == default ? baggageHolder.Baggage.ClearBaggage() : baggage.ClearBaggage();
+        }
+    }
+
+    public IReadOnlyDictionary<string, string> GetBaggage() => this.baggage ?? EmptyBaggage;
+
+    public string? GetBaggage(string name)
+    {
+        return this.baggage != null && this.baggage.TryGetValue(name, out string? value) ? value : null;
+    }
+
+    public Baggage SetBaggage(string name, string? value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return this.RemoveBaggage(name);
+
+        return new Baggage(
+            new Dictionary<string, string>(this.baggage ?? EmptyBaggage, StringComparer.OrdinalIgnoreCase)
+            {
+                [name] = value!,
+            });
+    }
+
+    public Baggage SetBaggage(params KeyValuePair<string, string?>[] baggageItems) => this.SetBaggage((IEnumerable<KeyValuePair<string, string?>>)baggageItems);
+
+    public Baggage SetBaggage(IEnumerable<KeyValuePair<string, string?>> baggageItems)
+    {
+        if (baggageItems?.Any() != true)
+            return this;
+
+        var newBaggage = new Dictionary<string, string>(this.baggage ?? EmptyBaggage, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var item in baggageItems)
+        {
+            if (string.IsNullOrEmpty(item.Value))
+                newBaggage.Remove(item.Key);
+            else
+                newBaggage[item.Key] = item.Value!;
+        }
+
+        return new Baggage(newBaggage);
+    }
+
+    public Baggage RemoveBaggage(string name)
+    {
+        var baggage = new Dictionary<string, string>(this.baggage ?? EmptyBaggage, StringComparer.OrdinalIgnoreCase);
+        baggage.Remove(name);
+
+        return new Baggage(baggage);
+    }
+
+    public Dictionary<string, string>.Enumerator GetEnumerator() => (this.baggage ?? EmptyBaggage).GetEnumerator();
+
+    public bool Equals(Baggage other) { ... }
+
+    public override bool Equals(object? obj) => (obj is Baggage baggage) && this.Equals(baggage);
+
+    public override int GetHashCode() { ... }
+
+    private static BaggageHolder EnsureBaggageHolder()
+    {
+        var baggageHolder = RuntimeContextSlot.Get();
+        if (baggageHolder == null)
+        {
+            baggageHolder = new BaggageHolder();
+            RuntimeContextSlot.Set(baggageHolder);
+        }
+
+        return baggageHolder;
+    }
+
+    private sealed class BaggageHolder
+    {
+        public Baggage Baggage;
+    }
+}
+//----------------------------Ʌ
 
 //--------------------------V
 public class ResourceBuilder
@@ -2944,6 +3152,23 @@ public class Resource
 //-------------------Ʌ
 
 //-------------------------------------------V
+public class AspNetCoreInstrumentationOptions
+{
+    public Func<HttpContext, bool> Filter { get; set; }   // <----------------------hil
+
+    public Action<Activity, HttpRequest> EnrichWithHttpRequest { get; set; }
+
+    public Action<Activity, HttpResponse> EnrichWithHttpResponse { get; set; }
+
+    public Action<Activity, Exception> EnrichWithException { get; set; }
+
+    public bool RecordException { get; set; }
+
+    public bool EnableGrpcAspNetCoreSupport { get; set; } = true;
+}
+//-------------------------------------------Ʌ
+
+//-------------------------------------------V
 public static class ResourceBuilderExtensions
 {
     private static readonly string InstanceId = Guid.NewGuid().ToString();
@@ -3114,8 +3339,6 @@ public class CompositeProcessor<T> : BaseProcessor<T>
 
     public CompositeProcessor(IEnumerable<BaseProcessor<T>> processors)
     {
-        Guard.ThrowIfNull(processors);
-
         using var iter = processors.GetEnumerator();
         if (!iter.MoveNext())
         {
@@ -3293,7 +3516,7 @@ public abstract class BaseExportProcessor<T> : BaseProcessor<T> where T : class
 
     public override string ToString() => friendlyTypeName;
 
-    public sealed override void OnStart(T data) { }
+    public sealed override void OnStart(T data) { }  // <-----------------do nothing
 
     public override void OnEnd(T data)
     {
@@ -3624,24 +3847,13 @@ public abstract class BatchExportProcessor<T> : BaseExportProcessor<T> where T :
 //---------------------------------------V
 public class BatchActivityExportProcessor : BatchExportProcessor<Activity>
 {
-    public BatchActivityExportProcessor(
-        BaseExporter<Activity> exporter,
-        int maxQueueSize = DefaultMaxQueueSize,
-        int scheduledDelayMilliseconds = DefaultScheduledDelayMilliseconds,
-        int exporterTimeoutMilliseconds = DefaultExporterTimeoutMilliseconds,
-        int maxExportBatchSize = DefaultMaxExportBatchSize)
-        : base(
-            exporter,
-            maxQueueSize,
-            scheduledDelayMilliseconds,
-            exporterTimeoutMilliseconds,
-            maxExportBatchSize)
-    {
-    }
+    public BatchActivityExportProcessor(BaseExporter<Activity> exporter, int maxQueueSize = DefaultMaxQueueSize, int scheduledDelayMilliseconds = DefaultScheduledDelayMilliseconds,
+                                        int exporterTimeoutMilliseconds = DefaultExporterTimeoutMilliseconds, int maxExportBatchSize = DefaultMaxExportBatchSize)
+    : base(exporter, maxQueueSize, scheduledDelayMilliseconds, exporterTimeoutMilliseconds, maxExportBatchSize) { }
 
     public override void OnEnd(Activity data)
     {
-        if (!data.Recorded)
+        if (!data.Recorded)  // <----------sam, only export ActivitySamplingResult.AllDataAndRecorded, not ActivitySamplingResult.AllData
         {
             return;
         }
@@ -4136,7 +4348,8 @@ Resource associated with Activity:
     telemetry.sdk.name: opentelemetry
     telemetry.sdk.language: dotnet
     telemetry.sdk.version: 1.12.0
-    service.name: unknown_service:WeatherForecastSimpleTracing
+    service.name: unknown_service:WeatherForecastSimpleTracing  # <-----------------------check WeatherForecastSimpleTracing VS solution for complete code
+    
 
 Activity.TraceId:            37285f6aa3b5b2cd9bee843c581e9368
 Activity.SpanId:             d0017112214dc65f   # <---------------parentActivity
@@ -4918,4 +5131,308 @@ public class JaegerExporterOptions
     public Func<HttpClient> HttpClientFactory { get; set; } = DefaultHttpClientFactory;
 }
 //--------------------------------Ʌ
+```
+
+```C#
+//-----------------------------------V
+public readonly struct SamplingResult : IEquatable<SamplingResult>
+{
+    public SamplingResult(SamplingDecision decision) : this(decision, attributes: null, traceStateString: null) { }
+    public SamplingResult(bool isSampled) : this(decision: isSampled ? SamplingDecision.RecordAndSample : SamplingDecision.Drop, attributes: null, traceStateString: null) { }
+    public SamplingResult(SamplingDecision decision, IEnumerable<KeyValuePair<string, object>> attributes) : this(decision, attributes, traceStateString: null) { }
+    public SamplingResult(SamplingDecision decision, string traceStateString) : this(decision, attributes: null, traceStateString) { }
+
+   
+    public SamplingResult(SamplingDecision decision, IEnumerable<KeyValuePair<string, object>>? attributes, string? traceStateString)
+    {
+        this.Decision = decision;
+
+        this.Attributes = attributes ?? Enumerable.Empty<KeyValuePair<string, object>>();
+
+        this.TraceStateString = traceStateString;
+    }
+
+    public SamplingDecision Decision { get; }
+
+    public IEnumerable<KeyValuePair<string, object>> Attributes { get; }
+
+    public string? TraceStateString { get; }
+
+    public static bool operator ==(SamplingResult decision1, SamplingResult decision2) => decision1.Equals(decision2);
+
+    public static bool operator !=(SamplingResult decision1, SamplingResult decision2) => !decision1.Equals(decision2);
+
+    public override bool Equals(object? obj) => obj is SamplingResult other && this.Equals(other);
+
+    public override int GetHashCode()
+    {
+        HashCode hashCode = default;
+        hashCode.Add(this.Decision);
+        hashCode.Add(this.Attributes);
+        hashCode.Add(this.TraceStateString);
+
+        var hash = hashCode.ToHashCode();
+
+        return hash;
+    }
+
+    public bool Equals(SamplingResult other)
+    {
+        return this.Decision == other.Decision && this.Attributes.SequenceEqual(other.Attributes) && this.TraceStateString == other.TraceStateString;
+    }
+}
+//-----------------------------------Ʌ
+
+//----------------------------------V
+public sealed class AlwaysOffSampler : Sampler
+{
+    public override SamplingResult ShouldSample(in SamplingParameters samplingParameters)
+    {
+        return new SamplingResult(SamplingDecision.Drop);
+    }
+}
+//----------------------------------Ʌ
+
+//------------------------------------V
+public sealed class ParentBasedSampler : Sampler
+{
+    private readonly Sampler rootSampler;
+
+    private readonly Sampler remoteParentSampled;
+    private readonly Sampler remoteParentNotSampled;
+    private readonly Sampler localParentSampled;
+    private readonly Sampler localParentNotSampled;
+
+    public ParentBasedSampler(Sampler rootSampler)
+    {
+        this.rootSampler = rootSampler;
+        this.Description = $"ParentBased{{{rootSampler.Description}}}";
+
+        this.remoteParentSampled = new AlwaysOnSampler();
+        this.remoteParentNotSampled = new AlwaysOffSampler();
+        this.localParentSampled = new AlwaysOnSampler();  // <-----------------
+        this.localParentNotSampled = new AlwaysOffSampler();
+    }
+
+    public ParentBasedSampler(Sampler rootSampler, Sampler? remoteParentSampled = null, Sampler? remoteParentNotSampled = null, Sampler? localParentSampled = null,  Sampler? localParentNotSampled = null) : this(rootSampler)
+    {
+        this.remoteParentSampled = remoteParentSampled ?? new AlwaysOnSampler();
+        this.remoteParentNotSampled = remoteParentNotSampled ?? new AlwaysOffSampler();
+        this.localParentSampled = localParentSampled ?? new AlwaysOnSampler();
+        this.localParentNotSampled = localParentNotSampled ?? new AlwaysOffSampler();
+    }
+
+    public override SamplingResult ShouldSample(in SamplingParameters samplingParameters)
+    {
+        var parentContext = samplingParameters.ParentContext;
+        if (parentContext.TraceId == default)
+        {
+            // If no parent, use the rootSampler to determine sampling.
+            return this.rootSampler.ShouldSample(samplingParameters);
+        }
+      
+        if ((parentContext.TraceFlags & ActivityTraceFlags.Recorded) != 0)  // when parent is sampled
+        {
+            if (parentContext.IsRemote)
+                return this.remoteParentSampled.ShouldSample(samplingParameters);
+            else
+                return this.localParentSampled.ShouldSample(samplingParameters);  // localParentSampled is AlwaysOnSampler by default
+        }
+
+        // If parent is not sampled => delegate to the "not sampled" inner samplers.
+        if (parentContext.IsRemote)
+            return this.remoteParentNotSampled.ShouldSample(samplingParameters);
+        else
+            return this.localParentNotSampled.ShouldSample(samplingParameters);
+    }
+}
+//------------------------------------Ʌ
+
+//------------------------------------------V
+public sealed class TraceIdRatioBasedSampler : Sampler
+{
+    private readonly long idUpperBound;
+    private readonly double probability;
+
+    public TraceIdRatioBasedSampler(double probability)
+    {
+        this.probability = probability;
+
+        // The expected description is like TraceIdRatioBasedSampler{0.000100}
+        this.Description = "TraceIdRatioBasedSampler{" + this.probability.ToString("F6", CultureInfo.InvariantCulture) + "}";
+
+        if (this.probability == 0.0)
+        {
+            this.idUpperBound = long.MinValue;
+        }
+        else if (this.probability == 1.0)
+        {
+            this.idUpperBound = long.MaxValue;
+        }
+        else
+        {
+            this.idUpperBound = (long)(probability * long.MaxValue);
+        }
+    }
+
+    public override SamplingResult ShouldSample(in SamplingParameters samplingParameters)
+    {
+        Span<byte> traceIdBytes = stackalloc byte[16];
+        samplingParameters.TraceId.CopyTo(traceIdBytes);
+        return new SamplingResult(Math.Abs(GetLowerLong(traceIdBytes)) < this.idUpperBound);
+    }
+
+    private static long GetLowerLong(ReadOnlySpan<byte> bytes)
+    {
+        long result = 0;
+        for (var i = 0; i < 8; i++)
+        {
+            result <<= 8;
+            result |= bytes[i] & 0xff;
+        }
+
+        return result;
+    }
+}
+//------------------------------------------Ʌ
+```
+
+===============================================================================
+
+```C#
+//------------------------------------------V
+namespace OpenTelemetry.Trace;
+
+internal static class SemanticConventions
+{
+    public const string AttributeNetTransport = "net.transport";
+    public const string AttributeNetPeerIp = "net.peer.ip";
+    public const string AttributeNetPeerPort = "net.peer.port";
+    public const string AttributeNetPeerName = "net.peer.name";
+    public const string AttributeNetHostIp = "net.host.ip";
+    public const string AttributeNetHostPort = "net.host.port";
+    public const string AttributeNetHostName = "net.host.name";
+
+    public const string AttributeEnduserId = "enduser.id";
+    public const string AttributeEnduserRole = "enduser.role";
+    public const string AttributeEnduserScope = "enduser.scope";
+
+    public const string AttributeHttpMethod = "http.method";
+    public const string AttributeHttpUrl = "http.url";
+    public const string AttributeHttpTarget = "http.target";
+    public const string AttributeHttpHost = "http.host";
+    public const string AttributeHttpScheme = "http.scheme";
+    public const string AttributeHttpStatusCode = "http.status_code";
+    public const string AttributeHttpStatusText = "http.status_text";
+    public const string AttributeHttpFlavor = "http.flavor";
+    public const string AttributeHttpServerName = "http.server_name";
+    public const string AttributeHttpRoute = "http.route";  // <------------------------------------
+    public const string AttributeHttpClientIP = "http.client_ip";
+    public const string AttributeHttpUserAgent = "http.user_agent";
+    public const string AttributeHttpRequestContentLength = "http.request_content_length";
+    public const string AttributeHttpRequestContentLengthUncompressed = "http.request_content_length_uncompressed";
+    public const string AttributeHttpResponseContentLength = "http.response_content_length";
+    public const string AttributeHttpResponseContentLengthUncompressed = "http.response_content_length_uncompressed";
+
+    public const string AttributeDbConnectionString = "db.connection_string";
+    public const string AttributeDbUser = "db.user";
+    public const string AttributeDbMsSqlInstanceName = "db.mssql.instance_name";
+    public const string AttributeDbJdbcDriverClassName = "db.jdbc.driver_classname";
+    public const string AttributeDbName = "db.name";
+    public const string AttributeDbStatement = "db.statement";
+    public const string AttributeDbSystem = "db.system";
+    public const string AttributeDbOperation = "db.operation";
+    public const string AttributeDbInstance = "db.instance";
+    public const string AttributeDbCassandraKeyspace = "db.cassandra.keyspace";
+    public const string AttributeDbHBaseNamespace = "db.hbase.namespace";
+    public const string AttributeDbRedisDatabaseIndex = "db.redis.database_index";
+    public const string AttributeDbMongoDbCollection = "db.mongodb.collection";
+
+    public const string AttributeRpcSystem = "rpc.system";
+    public const string AttributeRpcService = "rpc.service";
+    public const string AttributeRpcMethod = "rpc.method";
+    public const string AttributeRpcGrpcStatusCode = "rpc.grpc.status_code";
+
+    public const string AttributeMessageType = "message.type";
+    public const string AttributeMessageId = "message.id";
+    public const string AttributeMessageCompressedSize = "message.compressed_size";
+    public const string AttributeMessageUncompressedSize = "message.uncompressed_size";
+
+    public const string AttributeFaasTrigger = "faas.trigger";
+    public const string AttributeFaasExecution = "faas.execution";
+    public const string AttributeFaasDocumentCollection = "faas.document.collection";
+    public const string AttributeFaasDocumentOperation = "faas.document.operation";
+    public const string AttributeFaasDocumentTime = "faas.document.time";
+    public const string AttributeFaasDocumentName = "faas.document.name";
+    public const string AttributeFaasTime = "faas.time";
+    public const string AttributeFaasCron = "faas.cron";
+
+    public const string AttributeMessagingSystem = "messaging.system";
+    public const string AttributeMessagingDestination = "messaging.destination";
+    public const string AttributeMessagingDestinationKind = "messaging.destination_kind";
+    public const string AttributeMessagingTempDestination = "messaging.temp_destination";
+    public const string AttributeMessagingProtocol = "messaging.protocol";
+    public const string AttributeMessagingProtocolVersion = "messaging.protocol_version";
+    public const string AttributeMessagingUrl = "messaging.url";
+    public const string AttributeMessagingMessageId = "messaging.message_id";
+    public const string AttributeMessagingConversationId = "messaging.conversation_id";
+    public const string AttributeMessagingPayloadSize = "messaging.message_payload_size_bytes";
+    public const string AttributeMessagingPayloadCompressedSize = "messaging.message_payload_compressed_size_bytes";
+    public const string AttributeMessagingOperation = "messaging.operation";
+
+    public const string AttributeExceptionEventName = "exception";
+    public const string AttributeExceptionType = "exception.type";
+    public const string AttributeExceptionMessage = "exception.message";
+    public const string AttributeExceptionStacktrace = "exception.stacktrace";
+    public const string AttributeErrorType = "error.type";
+
+    public const string AttributeHttpRequestMethod = "http.request.method"; // replaces: "http.method" (AttributeHttpMethod)
+    public const string AttributeHttpRequestMethodOriginal = "http.request.method_original";
+    public const string AttributeHttpResponseStatusCode = "http.response.status_code"; // replaces: "http.status_code" (AttributeHttpStatusCode)
+    public const string AttributeUrlScheme = "url.scheme"; // replaces: "http.scheme" (AttributeHttpScheme)
+    public const string AttributeUrlFull = "url.full"; // replaces: "http.url" (AttributeHttpUrl)
+    public const string AttributeUrlPath = "url.path"; // replaces: "http.target" (AttributeHttpTarget)
+    public const string AttributeUrlQuery = "url.query"; // replaces: "http.target" (AttributeHttpTarget)
+    public const string AttributeServerSocketAddress = "server.socket.address"; // replaces: "net.peer.ip" (AttributeNetPeerIp)
+
+    public const string AttributeClientAddress = "client.address";
+    public const string AttributeClientPort = "client.port";
+    public const string AttributeNetworkProtocolVersion = "network.protocol.version"; // replaces: "http.flavor" (AttributeHttpFlavor)
+    public const string AttributeNetworkProtocolName = "network.protocol.name";
+    public const string AttributeServerAddress = "server.address"; // replaces: "net.host.name" (AttributeNetHostName)
+    public const string AttributeServerPort = "server.port"; // replaces: "net.host.port" (AttributeNetHostPort)
+    public const string AttributeUserAgentOriginal = "user_agent.original"; // replaces: http.user_agent (AttributeHttpUserAgent)
+
+    // v1.23.0 Database spans
+    public const string AttributeNetworkPeerAddress = "network.peer.address"; // replaces: "net.peer.ip" (AttributeNetPeerIp)
+    public const string AttributeNetworkPeerPort = "network.peer.port"; // replaces: "net.peer.port" (AttributeNetPeerPort)
+
+    // v1.24.0 Messaging spans
+    public const string AttributeMessagingClientId = "messaging.client_id";
+    public const string AttributeMessagingDestinationName = "messaging.destination.name";
+
+    // v1.24.0 Messaging metrics
+    public const string MetricMessagingPublishDuration = "messaging.publish.duration";
+    public const string MetricMessagingPublishMessages = "messaging.publish.messages";
+    public const string MetricMessagingReceiveDuration = "messaging.receive.duration";
+    public const string MetricMessagingReceiveMessages = "messaging.receive.messages";
+
+    // v1.24.0 Messaging (Kafka)
+    public const string AttributeMessagingKafkaConsumerGroup = "messaging.kafka.consumer.group";
+    public const string AttributeMessagingKafkaDestinationPartition = "messaging.kafka.destination.partition";
+    public const string AttributeMessagingKafkaMessageKey = "messaging.kafka.message.key";
+    public const string AttributeMessagingKafkaMessageOffset = "messaging.kafka.message.offset";
+
+    // New database conventions:
+    public const string AttributeDbCollectionName = "db.collection.name";
+    public const string AttributeDbOperationName = "db.operation.name";
+    public const string AttributeDbSystemName = "db.system.name";
+    public const string AttributeDbNamespace = "db.namespace";
+    public const string AttributeDbResponseStatusCode = "db.response.status_code";
+    public const string AttributeDbOperationBatchSize = "db.operation.batch.size";
+    public const string AttributeDbQuerySummary = "db.query.summary";
+    public const string AttributeDbQueryText = "db.query.text";
+    public const string AttributeDbStoredProcedureName = "db.stored_procedure.name";
+}
+//------------------------------------------Ʌ
 ```

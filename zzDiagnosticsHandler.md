@@ -6,6 +6,8 @@
 internal sealed class DiagnosticsHandler : HttpMessageHandlerStage
 {
     private static readonly DiagnosticListener s_diagnosticListener = new DiagnosticListener(DiagnosticsHandlerLoggingStrings.DiagnosticListenerName);
+                                                                   // new DiagnosticListener("HttpHandlerDiagnosticListener")
+
     internal static readonly ActivitySource s_activitySource = new ActivitySource(DiagnosticsHandlerLoggingStrings.RequestNamespace);  // <--------------------!
                                                             // new ActivitySource("System.Net.Http")
 
@@ -68,7 +70,7 @@ internal sealed class DiagnosticsHandler : HttpMessageHandlerStage
             s_diagnosticListener.IsEnabled(DiagnosticsHandlerLoggingStrings.RequestActivityName, request)))
         {
                     // new Activity("System.Net.Http.HttpRequestOut")
-            activity = new Activity(DiagnosticsHandlerLoggingStrings.RequestActivityName).Start();  // <---------!dcp, is this the activity instance that passed to downstream
+            activity = new Activity(DiagnosticsHandlerLoggingStrings.RequestActivityName).Start();  // <---------!dcp, this is the activity instance that passed to downstream
         }                                                                                           // because in the downstream webapi, the activitiy's operation name
                                                                                                     // is Microsoft.AspNetCore.Hosting.HttpRequestIn
         return activity;
@@ -87,7 +89,7 @@ internal sealed class DiagnosticsHandler : HttpMessageHandlerStage
             // https://github.com/open-telemetry/semantic-conventions/blob/release/v1.23.x/docs/http/http-spans.md#name
             activity.DisplayName = HttpMethod.GetKnownMethod(request.Method.Method)?.Method ?? "HTTP";
 
-            if (activity.IsAllDataRequested)
+            if (activity.IsAllDataRequested)  // <----------------will not call following activity.SetTag("server.address", requestUri.Host) if IsAllDataRequested is false
             {
                 // Add standard tags known before sending the request.
                 KeyValuePair<string, object?> methodTag = DiagnosticsHelper.GetMethodTag(request.Method, out bool isUnknownMethod);

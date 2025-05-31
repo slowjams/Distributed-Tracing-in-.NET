@@ -164,7 +164,7 @@ public class Activity : IDisposable  // In .NET world, a span is represented by 
 
             SetCurrent(this);     // <-------------------------pact3.3., cact3.4.
 
-            Source.NotifyActivityStart(this);
+            Source.NotifyActivityStart(this);  // <------------call TracerProviderSdk.listener.ActivityStarted
         }
         return this;
     }
@@ -245,11 +245,11 @@ public class Activity : IDisposable  // In .NET world, a span is represented by 
             activity.HasRemoteParent = parentContext.IsRemote;
         }
 
-        activity.IsAllDataRequested = request == ActivitySamplingResult.AllData || request == ActivitySamplingResult.AllDataAndRecorded;
+        activity.IsAllDataRequested = request == ActivitySamplingResult.AllData || request == ActivitySamplingResult.AllDataAndRecorded;  // <----------------
  
-        if (request == ActivitySamplingResult.AllDataAndRecorded)
+        if (request == ActivitySamplingResult.AllDataAndRecorded)  // when sampling result is SamplingDecision.RecordAndSample
         {
-            activity.ActivityTraceFlags |= ActivityTraceFlags.Recorded;
+            activity.ActivityTraceFlags |= ActivityTraceFlags.Recorded;  // set up "samping bit" so it can propagate to next downstream service 
         }
 
         if (startTime != default)
@@ -307,6 +307,8 @@ public class Activity : IDisposable  // In .NET world, a span is represented by 
         return _traceId != null;
     }
 
+    public bool Recorded { get => (ActivityTraceFlags & ActivityTraceFlags.Recorded) != 0; }
+
     internal static bool TryConvertIdToContext(string traceParent, string? traceState, bool isRemote, out ActivityContext context) // <---------------dlr3.2.2
     {
         context = default;
@@ -334,6 +336,8 @@ public class Activity : IDisposable  // In .NET world, a span is represented by 
         return true;
     }
 
+    public ActivityContext Context => new ActivityContext(TraceId, SpanId, ActivityTraceFlags, TraceStateString);
+
     public string DisplayName 
     {
         get => _displayName ?? OperationName;
@@ -342,7 +346,7 @@ public class Activity : IDisposable  // In .NET world, a span is represented by 
     public string OperationName { get; }  // <-------no setter for OperationName
     public ActivitySource Source { get; }
 
-    public bool IsAllDataRequested { get; set; }
+    public bool IsAllDataRequested { get; set; } 
     public ActivityIdFormat IdFormat { get; }
     public ActivityKind Kind { get; }
     public IEnumerable<ActivityEvent> Events { get; }
@@ -469,8 +473,12 @@ public sealed class ActivitySource : IDisposable
                                 DateTimeOffset startTime = default
                                 )
         => CreateActivity(name, kind, parentContext, null, tags, links, startTime);   // <-------------------------pact1.0, cact1.0
+
+    public Activity? CreateActivity(string name, ActivityKind kind, ActivityContext parentContext, IEnumerable<KeyValuePair<string, object?>>? tags = null,
+                                    IEnumerable<ActivityLink>? links = null, ActivityIdFormat idFormat = ActivityIdFormat.Unknown)
+        => CreateActivity(name, kind, parentContext, null, tags, links, default, startIt: false, idFormat);
                                                                                      
-    // ...
+    // <----------- even though this method is called CreateActivity, but it might not create a brand new activity depending on sampling result
     private Activity? CreateActivity(   // <------------------------pact1.1, cact1.1, dlr3.2.4.0
                                      string name,   
                                      ActivityKind kind,
@@ -582,7 +590,8 @@ public sealed class ActivitySource : IDisposable
                 SampleActivity<ActivityContext>? sample = listener.Sample;
                 if (sample != null)
                 {
-                    ActivitySamplingResult dr = sample(ref data);
+                    ActivitySamplingResult dr = sample(ref data);  // <----------------sam, data is ActivityCreationOptions<ActivityContext>
+                                                                   // ihe Sampler is invoked for every span that is created, including when the parent span is not sampled
                     if (dr > result)
                     {
                         result = dr;
@@ -600,8 +609,8 @@ public sealed class ActivitySource : IDisposable
             traceState = aco.TraceState;
         }
 
-        if (samplingResult != ActivitySamplingResult.None)  // <-------------------------------------sam, discard the creation of Activity if needed
-        {
+        if (samplingResult != ActivitySamplingResult.None)  // <---------sam, stop the creation of Activity if the sampler explicitly drop it by return SamplingDecision.Drop
+        {                                                   // that's why ActivityListener.Sample doesn't take an parameter of Activity
             activity =  Activity.Create(this, name, kind, parentId, context, tags, links, startTime, samplerTags, samplingResult, startIt, idFormat, traceState); // dlr3.2.4.1
                         // <-------------------------pact1.2., cact1.2.                   startIt is true by default
         }
@@ -647,12 +656,12 @@ public sealed class ActivitySource : IDisposable
         s_activeSources.EnumWithAction((source, obj) => source._listeners?.Remove((ActivityListener) obj), listener);
     }
 
-    internal void NotifyActivityStart(Activity activity)
+    internal void NotifyActivityStart(Activity activity)  // <------------call TracerProviderSdk.listener.ActivityStarted
     {
         SynchronizedList<ActivityListener>? listeners = _listeners;
         if (listeners != null && listeners.Count > 0)
         {
-            listeners.EnumWithAction((listener, obj) => listener.ActivityStarted?.Invoke((Activity)obj), activity);
+            listeners.EnumWithAction((listener, obj) => listener.ActivityStarted?.Invoke((Activity)obj), activity);  // <---------------------!
         }
     }
 
@@ -788,7 +797,7 @@ public sealed class ActivityListener : IDisposable
     
     public SampleActivity<string>? SampleUsingParentId { get; set; }
 
-    public SampleActivity<ActivityContext>? Sample { get; set; }
+    public SampleActivity<ActivityContext>? Sample { get; set; }  // <-----------normally set by TracerProviderSdk, see ComputeActivitySamplingResult in OpenTelemetry
 
     public void Dispose() => ActivitySource.DetachListener(this);
 }
@@ -923,10 +932,10 @@ public enum ActivityIdFormat
 
 public enum ActivitySamplingResult
 {
-    None,
-    PropagationData,
-    AllData,
-    AllDataAndRecorded
+    None,                 // <-------------------------no activity instance will ever be created when sampling result is SamplingDecision.Drop
+    PropagationData,      // <-------------------------only collect TraceId and SpanId, NOT tags, baggage etc
+    AllData,              // <-------------------------tags, baggage will be collected, NOT marked as sampled (Activity.Recorded is false), will NOT be exported to tracing backend
+    AllDataAndRecorded    // <-------------------------marked as sampled, will be exported to tracing backend
 }
 
 //------------------------------------V
@@ -960,6 +969,58 @@ public readonly struct ActivitySpanId : IEquatable<ActivitySpanId>
     // same as ActivityTraceId
 }
 //------------------------------------Ʌ
+
+//----------------------------------V
+public readonly struct ActivityEvent  // events are time-stamped annotations that record something (e.g., retries, exceptions) 
+{                                     // that happened at a specific moment during the span. while tags are properties that are true for the entire duration of the span
+    private static readonly IEnumerable<KeyValuePair<string, object?>> s_emptyTags = Array.Empty<KeyValuePair<string, object?>>();
+    private readonly Activity.TagsLinkedList? _tags;
+
+    public ActivityEvent(string name) : this(name, DateTimeOffset.UtcNow, tags: null) { }
+
+    public ActivityEvent(string name, DateTimeOffset timestamp = default, ActivityTagsCollection? tags = null) : this(name, timestamp, tags, tags is null ? 0 : tags.Count) { }
+
+    internal ActivityEvent(string name, DateTimeOffset timestamp, ref TagList tags) : this(name, timestamp, tags, tags.Count) { }
+
+    private ActivityEvent(string name, DateTimeOffset timestamp, IEnumerable<KeyValuePair<string, object?>>? tags, int tagsCount)
+    {
+        Name = name ?? string.Empty;
+        Timestamp = timestamp != default ? timestamp : DateTimeOffset.UtcNow;
+
+        _tags = tagsCount > 0 ? new Activity.TagsLinkedList(tags!) : null;
+    }
+
+    public string Name { get; }
+
+    public DateTimeOffset Timestamp { get; }
+
+    public IEnumerable<KeyValuePair<string, object?>> Tags => _tags ?? s_emptyTags;
+
+    public Activity.Enumerator<KeyValuePair<string, object?>> EnumerateTagObjects() => new Activity.Enumerator<KeyValuePair<string, object?>>(_tags?.First);
+}
+//----------------------------------Ʌ
+
+//-----------------------------------------V
+public readonly partial struct ActivityLink : IEquatable<ActivityLink>
+{
+    private readonly Activity.TagsLinkedList? _tags;
+
+    public ActivityLink(ActivityContext context, ActivityTagsCollection? tags = null)
+    {
+        Context = context;
+
+        _tags = tags?.Count > 0 ? new Activity.TagsLinkedList(tags) : null;
+    }
+
+    public ActivityContext Context { get; }
+
+    public IEnumerable<KeyValuePair<string, object?>>? Tags => _tags;
+
+    public override bool Equals([NotNullWhen(true)] object? obj) => (obj is ActivityLink link) && this.Equals(link);
+
+    public Activity.Enumerator<KeyValuePair<string, object?>> EnumerateTagObjects() => new Activity.Enumerator<KeyValuePair<string, object?>>(_tags?.First);
+}
+//-----------------------------------------Ʌ
 ```
 
 ```C#
