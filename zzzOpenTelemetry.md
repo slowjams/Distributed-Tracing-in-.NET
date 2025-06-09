@@ -59,7 +59,7 @@ public class Program
                 .AddJaegerExporter(opts =>
                 {
                     opts.Protocol = JaegerExportProtocol.Grpc;
-                    opts.Endpoint = new Uri("http://jaeger.mydomain.local:14250"); // bypass OpenTelemetry Collector, send traces to Jaeger directly
+                    opts.Endpoint = new Uri("http://jaeger.mydomain.local:14250"); // bypass OpenTelemetry Collector, send traces to Jaeger's gRPC endpoint directly
                 })
                 */
                 .AddSource("Tracing.NET")  // <----------------- check acts to see how ActivityListener in tpsact can use this setting
@@ -67,8 +67,14 @@ public class Program
     }
 
     /*
-       port 4317 is OpenTelemetry Collector's gRPC receiver
-       port 14268 is OpenTelemetry jaeger's collector on HTTP
+       port 4317 is OpenTelemetry Collector's gRPC receiver, Jaeger also expose this port to consumer OTEL messages then converts them to Jaeger compliant messages 
+       port 4318 is OpenTelemetry Collector's HTTP receiver, Jaeger also expose this port to consumer OTEL messages then converts them to Jaeger compliant messages 
+
+       port 14250 is OpenTelemetry Collector's Jaeger gRPC receiver, Jaeger also expose this port for directly consumption of Jaeger compliant messages 
+       port 14268 is OpenTelemetry Collector's Jaeger HTTP receiver, Jaeger also expose this port for directly consumption of Jaeger compliant messages
+
+       note that Jaeger has its internal component that consumes OTEL messages,  so it has many combinations between AddXXXExporter and otel collector, refer to Demystifying Tracing
+       the purpose is to easy to swap between Jaeger and OTEL Collector as your trace ingestion point without changing client/exporter configuration
     */
 }
 ```
@@ -4519,7 +4525,7 @@ public class OtlpExporterOptions : IOtlpExporterOptions
 {
     internal const string DefaultGrpcEndpoint = "http://localhost:4317";
     internal const string DefaultHttpEndpoint = "http://localhost:4318";
-    internal const OtlpExportProtocol DefaultOtlpExportProtocol = OtlpExportProtocol.Grpc;  // <-----------------------
+    internal const OtlpExportProtocol DefaultOtlpExportProtocol = OtlpExportProtocol.Grpc;  // <-----------------------Grpc is the default
     /*
     public enum OtlpExportProtocol : byte
     {
@@ -4744,7 +4750,7 @@ public class OtlpTraceExporter : BaseExporter<Activity>
 
     internal Resource Resource => this.resource ??= this.ParentProvider.GetResource();
 
-    public override ExportResult Export(in Batch<Activity> activityBatch)   // serialize Activities to OTLP Protobuf and send to endpoin
+    public override ExportResult Export(in Batch<Activity> activityBatch)   // serialize Activities to OTLP Protobuf and send to endpoint
     {
         // Prevents the exporter's gRPC and HTTP operations from being instrumented.
         using var scope = SuppressInstrumentationScope.Begin();
@@ -5272,6 +5278,7 @@ public class JaegerExporter : BaseExporter<Activity>
             foreach (var activity in activityBatch)
             {
                 var jaegerSpan = activity.ToJaegerSpan();  // <-------------------! add tags such as "otel.status_code" and "otel.status_description"
+                                                           // based on the activity's properties
                 this.AppendSpan(jaegerSpan);
                 jaegerSpan.Return();
             }

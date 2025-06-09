@@ -272,7 +272,77 @@ service:
       exporters: [logging]
 ```
 
+There are 3 combinations between exporter and collector:
 
+1. `AddOtlpExporter`, otel collector NOT involved
+
+says you don't use OpenTelemetry Collector, you can do
+
+```C#
+.AddOtlpExporter(options => 
+    options.Endpoint = new Uri("http://localhost:4317")
+```
+
+```yml
+## docker-compose file
+jaeger:
+  image: jaegertracing/all-in-one:1.58.0
+  ports:
+    - "16686:16686" # Jaeger Web UI
+    - "4317:4317" # OTLP format consumed by jaeger's collector <--------------------------
+```
+
+because jaeger can also OTEL messages then converts them to Jaeger compliant messages
+
+
+2. `AddOtlpExporter`, otel collector involved
+
+```C#
+.AddOtlpExporter(options => 
+    options.Endpoint = new Uri("http://localhost:4317"))  // <----------------4317 remains the same
+```
+
+messages consumed by otel collector's gRPC receiver on port 4317 (otel collector running as docker instance with otel-collector-config.yml)
+otel collector sets exporter to be jaeger endpoint on port 14250:
+
+```yml
+## otel-collector-config.yml
+receivers:
+  otlp:
+    protocols:
+      grpc: # Jaeger gRPC receiver, listens on port 14250 by default
+
+exporters:
+  jaeger:
+    endpoint: jaeger:14250
+```
+
+3. `AddJaegerExporter`, otel collector involved
+
+```C#
+.AddJaegerExporter(opts =>   
+    opts.Endpoint = new Uri("http://localhost:14250/api/traces"));         
+```
+messages consumed by otel collector's Jaeger gRPC receiver on port 14250 (otel collector running as docker instance with otel-collector-config.yml)
+
+```yml
+## otel-collector-config.yml
+receivers:
+  jaeger:
+    protocols:
+      grpc:  # Jaeger gRPC receiver, listens on port 14250 by default
+
+exporters:
+  jaeger:
+    endpoint: jaeger:14250  # Export to Jaeger collector's gRPC endpoint
+```
+
+4. `AddJaegerExporter`, otel collector NOT involved
+
+```C#
+.AddJaegerExporter(opts =>
+    opts.Endpoint = new Uri("http://jaeger.mydomain.local:14250")); // bypass OpenTelemetry Collector, send traces to Jaeger's gRPC endpoint directly
+```
 
 
 Let's revisit how asp.net create an activity for incoming request:
