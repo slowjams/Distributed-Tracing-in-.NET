@@ -45,8 +45,9 @@ static void ConfigureTelemetry(WebApplicationBuilder builder)
 {
     var env = new KeyValuePair<string, object>("env", builder.Environment.EnvironmentName);
     var resourceBuilder = ResourceBuilder.CreateDefault()
-        .AddService("frontend", "memes", "1.0.0")
-        .AddAttributes(new[] {env});
+        //.AddService("frontend-slowjams", "memes", "1.0.0")
+        .AddAttributes(new[] { env });
+
     var samplingProbability = builder.Configuration.GetSection("Sampling").GetValue<double>("Probability");
 
     builder.Services.AddOpenTelemetry()
@@ -56,7 +57,7 @@ static void ConfigureTelemetry(WebApplicationBuilder builder)
             .SetResourceBuilder(resourceBuilder)
             .AddHttpClientInstrumentation(options =>
             {
-                options.EnrichWithHttpRequestMessage = (act, req) =>
+                options.EnrichWithHttpRequestMessage = (act, req) =>  // req is HttpRequestMessage
                 {
                     if (req.Options.TryGetValue(new HttpRequestOptionsKey<int>("try"), out var tryCount) && tryCount > 0)
                         act.SetTag("http.resend_count", tryCount);
@@ -64,13 +65,15 @@ static void ConfigureTelemetry(WebApplicationBuilder builder)
                     act.SetTag("http.request_content_length", req.Content?.Headers.ContentLength);
                 };
 
-                options.EnrichWithHttpResponseMessage = (activity, response) =>
+                options.EnrichWithHttpResponseMessage = (activity, response) =>  // response is HttpResponseMessage
                     activity.SetTag("http.response_content_length", response.Content.Headers.ContentLength);
 
                 options.RecordException = true;
             })
             .AddAspNetCoreInstrumentation(o => o.Filter = ctx => !IsStaticFile(ctx.Request.Path))
-            .AddOtlpExporter())
+            .AddConsoleExporter()
+            .AddOtlpExporter()
+            )        
         .WithMetrics(builder => builder
             .AddView("process.runtime.dotnet.jit.il_compiled.size", MetricStreamConfiguration.Drop)
             .AddView("http.server.duration", new MetricStreamConfiguration()

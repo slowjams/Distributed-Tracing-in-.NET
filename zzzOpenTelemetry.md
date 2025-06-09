@@ -7,7 +7,7 @@ public class Program
     {
         // ...
         builder.Services
-            .AddOpenTelemetry()
+            .AddOpenTelemetry()  // register TelemetryHostedService as IHostedService
             .WithTracing(builder =>  // builder is TracerProviderBuilder
                 builder
                 .AddAspNetCoreInstrumentation(opt =>   // <------------!important add listener(`HttpInListener`) for ActivitySource("Microsoft.AspNetCore") 
@@ -39,7 +39,10 @@ public class Program
                     options.RecordException = true;
                 })
                 .AddConsoleExporter()
-                .SetResourceBuilder(ResourceBuilder.CreateDefault().AddService("App1"))             
+                .SetResourceBuilder(
+                    ResourceBuilder.CreateDefault()  // <------------------rb0
+                        .AddService("myApp")
+                        .AddAttributes(new[] { new KeyValuePair<string, object>("env", builder.Environment.EnvironmentName) }))             
                 .AddOtlpExporter(opts =>  // opts is OtlpExporterOptions
                 {
                     opts.Protocol = OtlpExportProtocol.Grpc;  // no really need to set it as by default OTLP over gRPC, setting the protocol explicitly is a good practice
@@ -69,6 +72,23 @@ public class Program
     */
 }
 ```
+
+if using Console app:
+
+```C#
+static void Main(string[] args)
+{
+    using var provider = Sdk.CreateTracerProviderBuilder()
+        .ConfigureResource(b => b.AddService("activity-sample"))
+        .AddSource("Worker")
+        .AddJaegerExporter()
+        .AddConsoleExporter()
+        .Build()!;  // <----------------------Build() creates a `new TracerProviderSdk()` which creates an ActivityListener,
+                    //  Build() is not requred for web api as above because TelemetryHostedService does the job
+    // ...  
+}
+```
+
 
 ```C#
 class MemeNameEnrichingProcessor : BaseProcessor<Activity>
@@ -1114,7 +1134,7 @@ public static class AspNetCoreInstrumentationTracerProviderBuilderExtensions
         }
         else
         {
-            builder.AddSource(HttpInListener.ActivitySourceName);
+            builder.AddSource(HttpInListener.ActivitySourceName);  // <----------------------
             builder.AddLegacySource(HttpInListener.ActivityOperationName); // for the activities created by AspNetCore
         }
         // ...
@@ -1307,7 +1327,7 @@ internal sealed class AspNetCoreInstrumentation : IDisposable
 //-------------------------------------------------V
 internal sealed class HttpHandlerDiagnosticListener : ListenerHandler
 {
-    internal const string HttpClientActivitySourceName = "System.Net.Http";
+    internal const string HttpClientActivitySourceName = "System.Net.Http";  // <-------------------------------------
     internal static readonly AssemblyName AssemblyName = typeof(HttpHandlerDiagnosticListener).Assembly.GetName();
     internal static readonly bool IsNet7OrGreater = Environment.Version.Major >= 7;
     internal static readonly bool IsNet9OrGreater = Environment.Version.Major >= 9;
@@ -1551,27 +1571,27 @@ internal class HttpInListener : ListenerHandler
 
     public override void OnEventWritten(string name, object? payload)  // <--------------hil
     {
-        var activity = Activity.Current!;  // <---------------------
+        var activity = Activity.Current!;  // <---------! the source DiagnosticsHandler doesn't pass Activity, the HttpInListener has to get it by itself,  that is the pattern
 
         switch (name)
         {
             case OnStartEvent:
-                {
-                    this.OnStartActivity(activity, payload);
-                }
+            {
+                this.OnStartActivity(activity, payload);  // <----------------------
+            }
 
                 break;
             case OnStopEvent:
-                {
-                    this.OnStopActivity(activity, payload);
-                }
+            {
+                this.OnStopActivity(activity, payload);  // <----------------------
+            }
 
                 break;
             case OnUnhandledHostingExceptionEvent:
             case OnUnHandledDiagnosticsExceptionEvent:
-                {
-                    this.OnException(activity, payload);
-                }
+            {
+                this.OnException(activity, payload);  // <----------------------oe, related to HttpClientTraceInstrumentationOptions.RecordException
+            }
 
                 break;
             default:
@@ -1776,7 +1796,7 @@ internal class HttpInListener : ListenerHandler
 
             activity.SetTag(SemanticConventions.AttributeErrorType, exc.GetType().FullName);
 
-            if (this.options.RecordException)
+            if (this.options.RecordException)  // <--------------------------oe
                 activity.AddException(exc);
 
             activity.SetStatus(ActivityStatusCode.Error);
@@ -2289,7 +2309,6 @@ internal sealed class TracerProviderSdk : TracerProvider
 
     internal TracerProviderSdk(IServiceProvider serviceProvider, bool ownsServiceProvider)
     {
-
         TracerProviderBuilderSdk state = serviceProvider!.GetRequiredService<TracerProviderBuilderSdk>();
         state.RegisterProvider(this);
 
@@ -2313,7 +2332,7 @@ internal sealed class TracerProviderSdk : TracerProvider
 
         var resourceBuilder = state.ResourceBuilder ?? ResourceBuilder.CreateDefault();
         resourceBuilder.ServiceProvider = serviceProvider;
-        this.Resource = resourceBuilder.Build();
+        this.Resource = resourceBuilder.Build();  // <-------------------------------rb3
 
         this.sampler = GetSampler(serviceProvider!.GetRequiredService<IConfiguration>(), state.Sampler);  // <----------------sam0
         OpenTelemetrySdkEventSource.Log.TracerProviderSdkEvent($"Sampler added = \"{this.sampler.GetType()}\".");
@@ -2661,9 +2680,16 @@ internal sealed class TracerProviderSdk : TracerProvider
         return 1.0;
     }
 
-    private static ActivitySamplingResult ComputeActivitySamplingResult(ref ActivityCreationOptions<ActivityContext> options, Sampler sampler)
+    private static ActivitySamplingResult ComputeActivitySamplingResult(ref ActivityCreationOptions<ActivityContext> options, Sampler sampler)  // <------------------! casr
     {
-        var samplingParameters = new SamplingParameters(options.Parent, options.TraceId, options.Name, options.Kind, options.Tags, options.Links);  
+        var samplingParameters = new SamplingParameters(options.Parent, options.TraceId, options.Name, options.Kind, options.Tags, options.Links); 
+        /*
+          you might ask why SamplingParameters needs to take both ActivityContext(options.Parent) and ActivityTraceId (options.TraceId) as parameter 
+          as you can get traceId from ActivityContext. But for root span, options.Parent is default ActivityContext with traceId not being set at all,
+          and if you look at the ActivityCreationOptions struct, you will see the TraceId property check if the Parent is default ActivityContext, if it is
+          ActivityCreationOptions.TraceId will create a brand new traceId, that's why ParentBasedSampler checks on options.Parent (because it wants to know 
+          if it is rootspan case) while TraceIdRatioBasedSampler checks on options.TraceId
+        */
 
         SamplingResult samplingResult = sampler.ShouldSample(samplingParameters);  // <--------------sam
 
@@ -2951,11 +2977,11 @@ public class ResourceBuilder
 
     internal IServiceProvider? ServiceProvider { get; set; }
 
-    public static ResourceBuilder CreateDefault()
+    public static ResourceBuilder CreateDefault()  // <-------------------rb0
         => new ResourceBuilder()
-            .AddResource(DefaultResource)
-            .AddTelemetrySdk()
-            .AddEnvironmentVariableDetector();
+            .AddResource(DefaultResource)          
+            .AddTelemetrySdk()                     // <-------------------rb1
+            .AddEnvironmentVariableDetector();     // <-------------------rb2
 
     public static ResourceBuilder CreateEmpty() => new();
 
@@ -3173,7 +3199,7 @@ public static class ResourceBuilderExtensions
 {
     private static readonly string InstanceId = Guid.NewGuid().ToString();
 
-    private static Resource TelemetryResource { get; } = new Resource(new Dictionary<string, object>
+    private static Resource TelemetryResource { get; } = new Resource(new Dictionary<string, object>  // <---------------------rb1
     {
         [ResourceSemanticConventions.AttributeTelemetrySdkName] = "opentelemetry",
         [ResourceSemanticConventions.AttributeTelemetrySdkLanguage] = "dotnet",
@@ -3208,23 +3234,23 @@ public static class ResourceBuilderExtensions
         return resourceBuilder.AddResource(new Resource(resourceAttributes));
     }
 
-    public static ResourceBuilder AddTelemetrySdk(this ResourceBuilder resourceBuilder)
+    public static ResourceBuilder AddTelemetrySdk(this ResourceBuilder resourceBuilder)   // <---------------------rb1
     {
         return resourceBuilder.AddResource(TelemetryResource);
     }
 
-    public static ResourceBuilder AddAttributes(this ResourceBuilder resourceBuilder, IEnumerable<KeyValuePair<string, object>> attributes)
+    public static ResourceBuilder AddAttributes(this ResourceBuilder resourceBuilder, IEnumerable<KeyValuePair<string, object>> attributes)  // <---------------
     {
-        return resourceBuilder.AddResource(new Resource(attributes));
+        return resourceBuilder.AddResource(new Resource(attributes)); 
     }
 
-    public static ResourceBuilder AddEnvironmentVariableDetector(this ResourceBuilder resourceBuilder)
+    public static ResourceBuilder AddEnvironmentVariableDetector(this ResourceBuilder resourceBuilder)  // <---------------------rb2.0
     {
         Lazy<IConfiguration> configuration = new Lazy<IConfiguration>(() => new ConfigurationBuilder().AddEnvironmentVariables().Build());
 
         return resourceBuilder
             .AddDetectorInternal(sp => new OtelEnvResourceDetector(sp?.GetService<IConfiguration>() ?? configuration.Value))
-            .AddDetectorInternal(sp => new OtelServiceNameEnvVarDetector(sp?.GetService<IConfiguration>() ?? configuration.Value));
+            .AddDetectorInternal(sp => new OtelServiceNameEnvVarDetector(sp?.GetService<IConfiguration>() ?? configuration.Value)); // <---------------------rb2.1
     }
 }
 //-------------------------------------------Ʌ
@@ -3250,6 +3276,7 @@ internal sealed class OtelServiceNameEnvVarDetector : IResourceDetector
             resource = new Resource(new Dictionary<string, object>
             {
                 [ResourceSemanticConventions.AttributeServiceName] = envResourceAttributeValue,
+               // <--------------------------"service.name"
             });
         }
 
@@ -3915,7 +3942,7 @@ internal sealed class HttpHandlerDiagnosticListener : ListenerHandler
             case "System.Net.Http.HttpRequestOut.Stop":
                 OnStopActivity(current, payload);
                 break;
-            case "System.Net.Http.Exception":
+            case "System.Net.Http.Exception":  // <--------------------oe
                 OnException(current, payload);
                 break;
         }
@@ -4091,7 +4118,7 @@ internal sealed class HttpHandlerDiagnosticListener : ListenerHandler
         if (!string.IsNullOrEmpty(errorType))
             activity.SetTag("error.type", errorType);
 
-        if (options.RecordException)
+        if (options.RecordException)  // <--------------------------------
         {
             Exception exception = exc2;
             TagList tags = default(TagList);
@@ -4310,7 +4337,8 @@ public class ConsoleActivityExporter : ConsoleExporter<Activity>
                 }
             }
 
-            var resource = this.ParentProvider.GetResource();
+            var resource = this.ParentProvider.GetResource();  // <-----------rb4, Activity doesn't contain any "resource related" tags, only exporter takes in Resource 
+                                                               // and show them in Console or APM backend
             if (resource != Resource.Empty)
             {
                 this.WriteLine("Resource associated with Activity:");
@@ -4491,7 +4519,7 @@ public class OtlpExporterOptions : IOtlpExporterOptions
 {
     internal const string DefaultGrpcEndpoint = "http://localhost:4317";
     internal const string DefaultHttpEndpoint = "http://localhost:4318";
-    internal const OtlpExportProtocol DefaultOtlpExportProtocol = OtlpExportProtocol.Grpc;  // <-----------------
+    internal const OtlpExportProtocol DefaultOtlpExportProtocol = OtlpExportProtocol.Grpc;  // <-----------------------
     /*
     public enum OtlpExportProtocol : byte
     {
@@ -4710,7 +4738,8 @@ public class OtlpTraceExporter : BaseExporter<Activity>
     {
         this.sdkLimitOptions = sdkLimitOptions!;
         this.startWritePosition = exporterOptions!.Protocol == OtlpExportProtocol.Grpc ? GrpcStartWritePosition : 0;
-        this.transmissionHandler = transmissionHandler ?? exporterOptions!.GetExportTransmissionHandler(experimentalOptions, OtlpSignalType.Traces);
+        this.transmissionHandler = transmissionHandler ?? exporterOptions!.GetExportTransmissionHandler(experimentalOptions, OtlpSignalType.Traces);  // <----------------
+        // <--------------------OtlpExporterOptions's endpoint such as "http://localhost:4317" is "baked" into OtlpExporterTransmissionHandler
     }
 
     internal Resource Resource => this.resource ??= this.ParentProvider.GetResource();
@@ -4722,7 +4751,12 @@ public class OtlpTraceExporter : BaseExporter<Activity>
 
         try
         {
-            int writePosition = ProtobufOtlpTraceSerializer.WriteTraceData(ref this.buffer, this.startWritePosition, this.sdkLimitOptions, this.Resource, activityBatch);
+            int writePosition = ProtobufOtlpTraceSerializer.WriteTraceData(
+                ref this.buffer, 
+                this.startWritePosition, 
+                this.sdkLimitOptions, 
+                this.Resource,   // <---------------------------rb4, Activity doesn't contain any "resource related" tags, only exporter takes in Resource and show in APM backend
+                activityBatch);
 
             if (this.startWritePosition == GrpcStartWritePosition)
             {
@@ -4734,7 +4768,7 @@ public class OtlpTraceExporter : BaseExporter<Activity>
                 BinaryPrimitives.WriteUInt32BigEndian(data, (uint)dataLength);
             }
 
-            if (!this.transmissionHandler.TrySubmitRequest(this.buffer, writePosition))
+            if (!this.transmissionHandler.TrySubmitRequest(this.buffer, writePosition))  // <------------------------------------
             {
                 return ExportResult.Failure;
             }
@@ -4751,6 +4785,337 @@ public class OtlpTraceExporter : BaseExporter<Activity>
     protected override bool OnShutdown(int timeoutMilliseconds) => this.transmissionHandler.Shutdown(timeoutMilliseconds);
 }
 //----------------------------Ʌ
+
+//--------------------------------------------V
+internal class OtlpExporterTransmissionHandler : IDisposable
+{
+    public OtlpExporterTransmissionHandler(IExportClient exportClient, double timeoutMilliseconds)
+    {
+        this.ExportClient = exportClient;
+        this.TimeoutMilliseconds = timeoutMilliseconds;
+    }
+
+    internal IExportClient ExportClient { get; }
+
+    internal double TimeoutMilliseconds { get; }
+
+    public bool TrySubmitRequest(byte[] request, int contentLength)  // <----------------------
+    {
+        try
+        {
+            var deadlineUtc = DateTime.UtcNow.AddMilliseconds(this.TimeoutMilliseconds);
+            var response = this.ExportClient.SendExportRequest(request, contentLength, deadlineUtc);  // <---------------------
+            if (response.Success)
+            {
+                return true;
+            }
+
+            return this.OnSubmitRequestFailure(request, contentLength, response);
+        }
+        catch (Exception ex)
+        {
+            OpenTelemetryProtocolExporterEventSource.Log.TrySubmitRequestException(ex);
+            return false;
+        }
+    }
+
+    public bool Shutdown(int timeoutMilliseconds)
+    {
+        var sw = timeoutMilliseconds == Timeout.Infinite ? null : Stopwatch.StartNew();
+
+        this.OnShutdown(timeoutMilliseconds);
+
+        if (sw != null)
+        {
+            var timeout = timeoutMilliseconds - sw.ElapsedMilliseconds;
+
+            return this.ExportClient.Shutdown((int)Math.Max(timeout, 0));
+        }
+
+        return this.ExportClient.Shutdown(timeoutMilliseconds);
+    }
+
+    public void Dispose()
+    {
+        this.Dispose(true);
+        GC.SuppressFinalize(this);
+    }
+
+    protected virtual void OnShutdown(int timeoutMilliseconds) { }
+
+    protected virtual bool OnSubmitRequestFailure(byte[] request, int contentLength, ExportClientResponse response) => false;
+
+    protected bool TryRetryRequest(byte[] request, int contentLength, DateTime deadlineUtc, out ExportClientResponse response)
+    {
+        response = this.ExportClient.SendExportRequest(request, contentLength, deadlineUtc);
+        return response.Success;
+    }
+
+    protected virtual void Dispose(bool disposing) { }
+}
+//--------------------------------------------Ʌ
+
+//-------------------------------------------------V
+internal static class OtlpExporterOptionsExtensions
+{
+    private const string TraceGrpcServicePath = "opentelemetry.proto.collector.trace.v1.TraceService/Export";
+    private const string MetricsGrpcServicePath = "opentelemetry.proto.collector.metrics.v1.MetricsService/Export";
+    private const string LogsGrpcServicePath = "opentelemetry.proto.collector.logs.v1.LogsService/Export";
+
+    private const string TraceHttpServicePath = "v1/traces";
+    private const string MetricsHttpServicePath = "v1/metrics";
+    private const string LogsHttpServicePath = "v1/logs";
+
+    public static THeaders GetHeaders<THeaders>(this OtlpExporterOptions options, Action<THeaders, string, string> addHeader) where THeaders : new()
+    {
+        var optionHeaders = options.Headers;
+        var headers = new THeaders();
+        if (!string.IsNullOrEmpty(optionHeaders))
+        {
+            // According to the specification, URL-encoded headers must be supported.
+            optionHeaders = Uri.UnescapeDataString(optionHeaders);
+            ReadOnlySpan<char> headersSpan = optionHeaders.AsSpan();
+
+            while (!headersSpan.IsEmpty)
+            {
+                int commaIndex = headersSpan.IndexOf(',');
+                ReadOnlySpan<char> pair;
+                if (commaIndex == -1)
+                {
+                    pair = headersSpan;
+                    headersSpan = [];
+                }
+                else
+                {
+                    pair = headersSpan.Slice(0, commaIndex);
+                    headersSpan = headersSpan.Slice(commaIndex + 1);
+                }
+
+                int equalIndex = pair.IndexOf('=');
+                if (equalIndex == -1)
+                {
+                    throw new ArgumentException("Headers provided in an invalid format.");
+                }
+
+                var key = pair.Slice(0, equalIndex).Trim().ToString();
+                var value = pair.Slice(equalIndex + 1).Trim().ToString();
+                addHeader(headers, key, value);
+            }
+        }
+
+        foreach (var header in OtlpExporterOptions.StandardHeaders)
+        {
+            addHeader(headers, header.Key, header.Value);
+        }
+
+        return headers;
+    }
+
+    public static OtlpExporterTransmissionHandler GetExportTransmissionHandler(this OtlpExporterOptions options, ExperimentalOptions experimentalOptions, OtlpSignalType otlpSignalType)
+    {
+        IExportClient exportClient = GetExportClient(options, otlpSignalType);  // <---------------------------
+
+        double timeoutMilliseconds = exportClient is OtlpHttpExportClient httpTraceExportClient
+            ? httpTraceExportClient.HttpClient.Timeout.TotalMilliseconds
+            : options.TimeoutMilliseconds;
+
+        if (experimentalOptions.EnableInMemoryRetry)
+        {
+            return new OtlpExporterRetryTransmissionHandler(exportClient, timeoutMilliseconds);
+        }
+        else if (experimentalOptions.EnableDiskRetry)
+        {
+            return new OtlpExporterPersistentStorageTransmissionHandler(
+                exportClient,
+                timeoutMilliseconds,
+                Path.Combine(experimentalOptions.DiskRetryDirectoryPath, "traces"));
+        }
+        else
+        {
+            return new OtlpExporterTransmissionHandler(exportClient, timeoutMilliseconds);
+        }
+    }
+
+    public static IExportClient GetExportClient(this OtlpExporterOptions options, OtlpSignalType otlpSignalType)
+    {
+        var httpClient = options.HttpClientFactory?.Invoke() ?? throw new InvalidOperationException("OtlpExporterOptions was missing HttpClientFactory or it returned null.");
+
+        if (options.Protocol != OtlpExportProtocol.Grpc && options.Protocol != OtlpExportProtocol.HttpProtobuf)
+            throw new NotSupportedException($"Protocol {options.Protocol} is not supported.");
+
+        return otlpSignalType switch
+        {
+            OtlpSignalType.Traces => options.Protocol == OtlpExportProtocol.Grpc
+                ? new OtlpGrpcExportClient(options, httpClient, TraceGrpcServicePath)
+                : new OtlpHttpExportClient(options, httpClient, TraceHttpServicePath),
+
+            OtlpSignalType.Metrics => options.Protocol == OtlpExportProtocol.Grpc
+                ? new OtlpGrpcExportClient(options, httpClient, MetricsGrpcServicePath)
+                : new OtlpHttpExportClient(options, httpClient, MetricsHttpServicePath),
+
+            OtlpSignalType.Logs => options.Protocol == OtlpExportProtocol.Grpc
+                ? new OtlpGrpcExportClient(options, httpClient, LogsGrpcServicePath)
+                : new OtlpHttpExportClient(options, httpClient, LogsHttpServicePath),
+
+            _ => throw new NotSupportedException($"OtlpSignalType {otlpSignalType} is not supported."),
+        };
+    }
+
+    public static void TryEnableIHttpClientFactoryIntegration(this OtlpExporterOptions options, IServiceProvider serviceProvider, string httpClientName)
+    {
+        if (serviceProvider != null && options.Protocol == OtlpExportProtocol.HttpProtobuf && options.HttpClientFactory == options.DefaultHttpClientFactory)
+        {
+            options.HttpClientFactory = () =>
+            {
+                Type? httpClientFactoryType = Type.GetType("System.Net.Http.IHttpClientFactory, Microsoft.Extensions.Http", throwOnError: false);
+                if (httpClientFactoryType != null)
+                {
+                    object? httpClientFactory = serviceProvider.GetService(httpClientFactoryType);
+                    if (httpClientFactory != null)
+                    {
+                        MethodInfo? createClientMethod = httpClientFactoryType.GetMethod(
+                            "CreateClient",
+                            BindingFlags.Public | BindingFlags.Instance,
+                            binder: null,
+                            [typeof(string)],
+                            modifiers: null);
+                        if (createClientMethod != null)
+                        {
+                            HttpClient? client = (HttpClient?)createClientMethod.Invoke(httpClientFactory, [httpClientName]);
+
+                            if (client != null)
+                            {
+                                client.Timeout = TimeSpan.FromMilliseconds(options.TimeoutMilliseconds);
+
+                                return client;
+                            }
+                        }
+                    }
+                }
+
+                return options.DefaultHttpClientFactory();
+            };
+        }
+    }
+
+    internal static Uri AppendPathIfNotPresent(this Uri uri, string path);
+}
+//-------------------------------------------------Ʌ
+
+//--------------------------------------V
+internal abstract class OtlpExportClient : IExportClient
+{
+    private static readonly Version Http2RequestVersion = new(2, 0);
+
+    protected OtlpExportClient(OtlpExporterOptions options, HttpClient httpClient, string signalPath)
+    {
+        Uri exporterEndpoint;
+        if (options.Protocol == OtlpExportProtocol.Grpc)
+        {
+            exporterEndpoint = options.Endpoint.AppendPathIfNotPresent(signalPath);
+        }
+        else
+        {
+            exporterEndpoint = options.AppendSignalPathToEndpoint
+                ? options.Endpoint.AppendPathIfNotPresent(signalPath)
+                : options.Endpoint;
+        }
+
+        this.Endpoint = new UriBuilder(exporterEndpoint).Uri;
+        this.Headers = options.GetHeaders<Dictionary<string, string>>((d, k, v) => d.Add(k, v));
+        this.HttpClient = httpClient;
+    }
+
+    internal HttpClient HttpClient { get; }
+
+    internal Uri Endpoint { get; }
+
+    internal IReadOnlyDictionary<string, string> Headers { get; }
+
+    internal abstract MediaTypeHeaderValue MediaTypeHeader { get; }
+
+    internal virtual bool RequireHttp2 => false;
+
+    public abstract ExportClientResponse SendExportRequest(byte[] buffer, int contentLength, DateTime deadlineUtc, CancellationToken cancellationToken = default);
+
+    public bool Shutdown(int timeoutMilliseconds)
+    {
+        this.HttpClient.CancelPendingRequests();
+        return true;
+    }
+
+    protected HttpRequestMessage CreateHttpRequest(byte[] buffer, int contentLength)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Post, this.Endpoint);
+
+        if (this.RequireHttp2)
+        {
+            request.Version = Http2RequestVersion;
+            request.VersionPolicy = HttpVersionPolicy.RequestVersionExact;
+        }
+
+        foreach (var header in this.Headers)
+        {
+            request.Headers.Add(header.Key, header.Value);
+        }
+
+        // TODO: Support compression.
+
+        request.Content = new ByteArrayContent(buffer, 0, contentLength);
+        request.Content.Headers.ContentType = this.MediaTypeHeader;
+
+        return request;
+    }
+
+    protected HttpResponseMessage SendHttpRequest(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        return this.HttpClient.SendAsync(request, cancellationToken).GetAwaiter().GetResult();
+    }
+}
+//--------------------------------------Ʌ
+
+//----------------------------------------V
+internal sealed class OtlpHttpExportClient : OtlpExportClient
+{
+    internal static readonly MediaTypeHeaderValue MediaHeaderValue = new("application/x-protobuf");
+    private static readonly ExportClientHttpResponse SuccessExportResponse = new(success: true, deadlineUtc: default, response: null, exception: null);
+
+    internal OtlpHttpExportClient(OtlpExporterOptions options, HttpClient httpClient, string signalPath): base(options, httpClient, signalPath) { }
+
+    internal override MediaTypeHeaderValue MediaTypeHeader => MediaHeaderValue;
+
+    public override ExportClientResponse SendExportRequest(byte[] buffer, int contentLength, DateTime deadlineUtc, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            using var httpRequest = this.CreateHttpRequest(buffer, contentLength);  // <------------------
+            using var httpResponse = this.SendHttpRequest(httpRequest, cancellationToken);
+
+            try
+            {
+                httpResponse.EnsureSuccessStatusCode();
+            }
+            catch (HttpRequestException ex)
+            {
+                OpenTelemetryProtocolExporterEventSource.Log.HttpRequestFailed(this.Endpoint, ex);
+                return new ExportClientHttpResponse(success: false, deadlineUtc: deadlineUtc, response: httpResponse, ex);
+            }
+
+            return SuccessExportResponse;
+        }
+        catch (HttpRequestException ex)
+        {
+            OpenTelemetryProtocolExporterEventSource.Log.FailedToReachCollector(this.Endpoint, ex);
+            return new ExportClientHttpResponse(success: false, deadlineUtc: deadlineUtc, response: null, exception: ex);
+        }
+    }
+}
+
+internal sealed class OtlpGrpcExportClient : OtlpExportClient
+{
+    // ...
+}
+//----------------------------------------Ʌ
 
 //------------------------------------------------V
 public static class JaegerExporterHelperExtensions
@@ -4906,7 +5271,7 @@ public class JaegerExporter : BaseExporter<Activity>
 
             foreach (var activity in activityBatch)
             {
-                var jaegerSpan = activity.ToJaegerSpan();
+                var jaegerSpan = activity.ToJaegerSpan();  // <-------------------! add tags such as "otel.status_code" and "otel.status_description"
                 this.AppendSpan(jaegerSpan);
                 jaegerSpan.Return();
             }
@@ -5131,6 +5496,140 @@ public class JaegerExporterOptions
     public Func<HttpClient> HttpClientFactory { get; set; } = DefaultHttpClientFactory;
 }
 //--------------------------------Ʌ
+
+//--------------------------------------------V
+internal static class JaegerActivityExtensions
+{
+    internal const string JaegerErrorFlagTagName = "error";
+
+    // ...
+
+    public static JaegerSpan ToJaegerSpan(this Activity activity)
+    {
+        var jaegerTags = new TagEnumerationState
+        {
+            Tags = PooledList<JaegerTag>.Create(),
+        };
+
+        jaegerTags.EnumerateTags(activity);
+
+        if (activity.Status != ActivityStatusCode.Unset)
+        {
+            if (activity.Status == ActivityStatusCode.Ok)
+            {
+                PooledList<JaegerTag>.Add(
+                    ref jaegerTags.Tags,
+                    new JaegerTag(SpanAttributeConstants.StatusCodeKey, JaegerTagType.STRING, vStr: "OK"));
+            }
+            else
+            {
+                PooledList<JaegerTag>.Add(
+                    ref jaegerTags.Tags,
+                    new JaegerTag(SpanAttributeConstants.StatusCodeKey, JaegerTagType.STRING, vStr: "ERROR"));
+                    // <----------SpanAttributeConstants.StatusCodeKey is "otel.status_code"
+
+                PooledList<JaegerTag>.Add(
+                    ref jaegerTags.Tags,
+                    new JaegerTag(JaegerErrorFlagTagName, JaegerTagType.BOOL, vBool: true));
+
+                PooledList<JaegerTag>.Add(
+                    ref jaegerTags.Tags,
+                    new JaegerTag(SpanAttributeConstants.StatusDescriptionKey, JaegerTagType.STRING, vStr: activity.StatusDescription ?? string.Empty));
+                    // <----------SpanAttributeConstants.StatusDescriptionKey is "otel.status_description"
+            }
+        }
+        else if (jaegerTags.StatusCode.HasValue && jaegerTags.StatusCode != StatusCode.Unset)
+        {
+            PooledList<JaegerTag>.Add(
+                    ref jaegerTags.Tags,
+                    new JaegerTag(
+                        SpanAttributeConstants.StatusCodeKey,
+                        JaegerTagType.STRING,
+                        vStr: StatusHelper.GetTagValueForStatusCode(jaegerTags.StatusCode.Value)));
+
+            if (jaegerTags.StatusCode == StatusCode.Error)
+            {
+                PooledList<JaegerTag>.Add(
+                    ref jaegerTags.Tags,
+                    new JaegerTag(JaegerErrorFlagTagName, JaegerTagType.BOOL, vBool: true));
+
+                PooledList<JaegerTag>.Add(
+                    ref jaegerTags.Tags,
+                    new JaegerTag(SpanAttributeConstants.StatusDescriptionKey, JaegerTagType.STRING, vStr: jaegerTags.StatusDescription ?? string.Empty));
+            }
+        }
+
+        string peerServiceName = null;
+        if (activity.Kind == ActivityKind.Client || activity.Kind == ActivityKind.Producer)
+        {
+            PeerServiceResolver.Resolve(ref jaegerTags, out peerServiceName, out bool addAsTag);
+
+            if (peerServiceName != null && addAsTag)
+            {
+                PooledList<JaegerTag>.Add(ref jaegerTags.Tags, new JaegerTag(SemanticConventions.AttributePeerService, JaegerTagType.STRING, vStr: peerServiceName));
+            }
+        }
+
+        if (activity.Kind != ActivityKind.Internal)
+        {
+            string spanKind = null;
+
+            if (activity.Kind == ActivityKind.Server)
+                spanKind = "server";
+            else if (activity.Kind == ActivityKind.Client)
+                spanKind = "client";
+            else if (activity.Kind == ActivityKind.Consumer)
+                spanKind = "consumer";
+            else if (activity.Kind == ActivityKind.Producer)
+                spanKind = "producer";
+
+            if (spanKind != null)
+                PooledList<JaegerTag>.Add(ref jaegerTags.Tags, new JaegerTag("span.kind", JaegerTagType.STRING, vStr: spanKind));
+        }
+
+        var activitySource = activity.Source;
+        if (!string.IsNullOrEmpty(activitySource.Name))
+        {
+            PooledList<JaegerTag>.Add(ref jaegerTags.Tags, new JaegerTag("otel.library.name", JaegerTagType.STRING, vStr: activitySource.Name));
+            if (!string.IsNullOrEmpty(activitySource.Version))
+            {
+                PooledList<JaegerTag>.Add(ref jaegerTags.Tags, new JaegerTag("otel.library.version", JaegerTagType.STRING, vStr: activitySource.Version));
+            }
+        }
+
+        var traceId = Int128.Empty;
+        var spanId = Int128.Empty;
+        var parentSpanId = Int128.Empty;
+
+        if (activity.IdFormat == ActivityIdFormat.W3C)
+        {
+            // TODO: The check above should be enforced by the usage of the exporter. Perhaps enforce at higher-level.
+            traceId = new Int128(activity.TraceId);
+            spanId = new Int128(activity.SpanId);
+            if (activity.ParentSpanId != default)
+            {
+                parentSpanId = new Int128(activity.ParentSpanId);
+            }
+        }
+
+        return new JaegerSpan(
+            peerServiceName: peerServiceName,
+            traceIdLow: traceId.Low,
+            traceIdHigh: traceId.High,
+            spanId: spanId.Low,
+            parentSpanId: parentSpanId.Low,
+            operationName: activity.DisplayName,
+            flags: (activity.Context.TraceFlags & ActivityTraceFlags.Recorded) > 0 ? 0x1 : 0,
+            startTime: ToEpochMicroseconds(activity.StartTimeUtc),
+            duration: activity.Duration.Ticks / TicksPerMicrosecond,
+            references: activity.ToJaegerSpanRefs(),
+            tags: jaegerTags.Tags,
+            logs: activity.ToJaegerLogs());
+    }
+
+    // ...
+}
+//--------------------------------------------Ʌ
 ```
 
 ```C#
@@ -5295,6 +5794,35 @@ public sealed class TraceIdRatioBasedSampler : Sampler
     }
 }
 //------------------------------------------Ʌ
+
+//---------------------------------------V
+public readonly struct SamplingParameters
+{
+    public SamplingParameters(ActivityContext parentContext, ActivityTraceId traceId, string name, ActivityKind kind, IEnumerable<KeyValuePair<string, object?>>? tags = null,
+                              IEnumerable<ActivityLink>? links = null)
+    {
+        this.ParentContext = parentContext;
+        this.TraceId = traceId;
+        this.Kind = kind;
+        this.Tags = tags;
+        this.Links = links;
+
+        this.Name = name ?? string.Empty;
+    }
+
+    public ActivityContext ParentContext { get; }
+
+    public ActivityTraceId TraceId { get; }
+
+    public string Name { get; }
+
+    public ActivityKind Kind { get; }
+
+    public IEnumerable<KeyValuePair<string, object?>>? Tags { get; }
+
+    public IEnumerable<ActivityLink>? Links { get; }
+}
+//---------------------------------------Ʌ
 ```
 
 ===============================================================================
@@ -5433,6 +5961,105 @@ internal static class SemanticConventions
     public const string AttributeDbQuerySummary = "db.query.summary";
     public const string AttributeDbQueryText = "db.query.text";
     public const string AttributeDbStoredProcedureName = "db.stored_procedure.name";
+}
+//------------------------------------------Ʌ
+
+//-----------------------------------------------V
+internal static class ResourceSemanticConventions
+{
+    public const string AttributeServiceName = "service.name";  // <------------------------------
+    public const string AttributeServiceNamespace = "service.namespace";
+    public const string AttributeServiceInstance = "service.instance.id";
+    public const string AttributeServiceVersion = "service.version";
+
+    public const string AttributeTelemetrySdkName = "telemetry.sdk.name";
+    public const string AttributeTelemetrySdkLanguage = "telemetry.sdk.language";
+    public const string AttributeTelemetrySdkVersion = "telemetry.sdk.version";
+
+    public const string AttributeContainerName = "container.name";
+    public const string AttributeContainerImage = "container.image.name";
+    public const string AttributeContainerTag = "container.image.tag";
+
+    public const string AttributeFaasName = "faas.name";
+    public const string AttributeFaasId = "faas.id";
+    public const string AttributeFaasVersion = "faas.version";
+    public const string AttributeFaasInstance = "faas.instance";
+
+    public const string AttributeK8sCluster = "k8s.cluster.name";
+    public const string AttributeK8sNamespace = "k8s.namespace.name";
+    public const string AttributeK8sPod = "k8s.pod.name";
+    public const string AttributeK8sDeployment = "k8s.deployment.name";
+
+    public const string AttributeHostHostname = "host.hostname";
+    public const string AttributeHostId = "host.id";
+    public const string AttributeHostName = "host.name";
+    public const string AttributeHostType = "host.type";
+    public const string AttributeHostImageName = "host.image.name";
+    public const string AttributeHostImageId = "host.image.id";
+    public const string AttributeHostImageVersion = "host.image.version";
+
+    public const string AttributeProcessId = "process.id";
+    public const string AttributeProcessExecutableName = "process.executable.name";
+    public const string AttributeProcessExecutablePath = "process.executable.path";
+    public const string AttributeProcessCommand = "process.command";
+    public const string AttributeProcessCommandLine = "process.command_line";
+    public const string AttributeProcessUsername = "process.username";
+
+    public const string AttributeCloudProvider = "cloud.provider";
+    public const string AttributeCloudAccount = "cloud.account.id";
+    public const string AttributeCloudRegion = "cloud.region";
+    public const string AttributeCloudZone = "cloud.zone";
+    public const string AttributeComponent = "component";
+}
+//-----------------------------------------------Ʌ
+
+//--------------------------------V
+public static class OtelAttributes
+{
+    public const string AttributeOtelComponentName = "otel.component.name";
+    public const string AttributeOtelComponentType = "otel.component.type";
+    public const string AttributeOtelScopeName = "otel.scope.name";
+    public const string AttributeOtelScopeVersion = "otel.scope.version";
+    public const string AttributeOtelSpanSamplingResult = "otel.span.sampling_result";
+    public const string AttributeOtelStatusCode = "otel.status_code";
+    public const string AttributeOtelStatusDescription = "otel.status_description";
+
+    public static class OtelComponentTypeValues
+    {
+        public const string BatchingSpanProcessor = "batching_span_processor";
+        public const string SimpleSpanProcessor = "simple_span_processor";
+        public const string BatchingLogProcessor = "batching_log_processor";
+        public const string SimpleLogProcessor = "simple_log_processor";
+        public const string OtlpGrpcSpanExporter = "otlp_grpc_span_exporter";
+        public const string OtlpHttpSpanExporter = "otlp_http_span_exporter";
+        public const string OtlpHttpJsonSpanExporter = "otlp_http_json_span_exporter";
+        public const string OtlpGrpcLogExporter = "otlp_grpc_log_exporter";
+        public const string OtlpHttpLogExporter = "otlp_http_log_exporter";
+        public const string OtlpHttpJsonLogExporter = "otlp_http_json_log_exporter";
+        public const string PeriodicMetricReader = "periodic_metric_reader";
+        public const string OtlpGrpcMetricExporter = "otlp_grpc_metric_exporter";
+        public const string OtlpHttpMetricExporter = "otlp_http_metric_exporter";
+        public const string OtlpHttpJsonMetricExporter = "otlp_http_json_metric_exporter";
+    }
+
+    public static class OtelSpanSamplingResultValues
+    {
+        public const string RecordAndSample = "RECORD_AND_SAMPLE";
+    }
+
+    public static class OtelStatusCodeValues
+    {
+        public const string Ok = "OK";
+        public const string Error = "ERROR";
+    }
+}
+//--------------------------------Ʌ
+
+//------------------------------------------V
+internal static class SpanAttributeConstants
+{
+    public const string StatusCodeKey = "otel.status_code";
+    public const string StatusDescriptionKey = "otel.status_description";
 }
 //------------------------------------------Ʌ
 ```

@@ -1,0 +1,9 @@
+{
+  "profiles": {
+    "tracing-with-net": {
+      "commandName": "Project",
+      "commandLineArgs": "open-telemetry --scenario with-retries"
+      //"commandLineArgs": "activity-listener"
+    }
+  }
+}

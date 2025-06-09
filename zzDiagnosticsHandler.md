@@ -160,6 +160,7 @@ internal sealed class DiagnosticsHandler : HttpMessageHandlerStage
                 // Request is passed to provide some context if instrumentation was disabled and to avoid
                 // extensive Activity.Tags usage to tunnel request properties
                 Write(diagnosticListener, DiagnosticsHandlerLoggingStrings.ExceptionEventName, new ExceptionData(ex, request));
+                                         // <---------------oe "System.Net.Http.Exception"
             }
             throw;
         }

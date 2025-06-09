@@ -5,7 +5,7 @@ namespace ConsoleAppTracingDemo
     class ProgramActivitySource
     {
         //private static readonly ActivitySource ActivitySource = new ActivitySource("System.Net.Http");
-        static void Main(string[] args)
+        static void Mainz(string[] args)
         {
             using var listener = new ActivityListener
             {

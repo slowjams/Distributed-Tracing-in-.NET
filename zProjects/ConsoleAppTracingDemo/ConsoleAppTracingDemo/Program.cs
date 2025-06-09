@@ -2,10 +2,10 @@
 
 namespace ConsoleAppTracingDemo
 {
-    class Program
+    class Programxx
     {
         private static readonly ActivitySource ActivitySource = new ActivitySource("DemoApp.Tracing");
-        static void Mainz(string[] args)
+        static void Mainzz(string[] args)
         {
             using var listener = new ActivityListener
             {

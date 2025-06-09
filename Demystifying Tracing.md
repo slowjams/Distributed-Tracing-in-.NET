@@ -53,6 +53,17 @@ A `trace` is a set of related spans fully describing a logical end-to-end operat
 **In .NET world, a `span` is represented by an `Activity`, System.Span class is not related to distributed tracing.**
 
 
+
+## W3C Trace Context
+
+`traceparent: {version}-{trace-id}-{parent-span-id}-{sampling-state}`
+
+`b3: {trace-id}-{span-id}-{sampling-state}-{parent-span-id}` 
+{parent-span-id} is optional for root span OpenTelemetry and .NET ignore {parent-span-id}
+Service A ──►  b3: abc123-11111111-1 ──► Service B ──► abc123-22222222-1-11111111 ──► Service C ──► abc123-33333333-1-22222222 ──► Downstream Services
+
+
+
 ## Activity revisit
 
 ```C#
@@ -139,7 +150,7 @@ see pact and cact how parentActivity's context passed to childActivity.
 │ HostingApplication calls HostingApplicationDiagnostics.BeginRequest │
 │                            │                                        │
 │                            ▼                                        │
-│            BeginRequest creates an Activity                         │
+│          BeginRequest creates and starts an Activity                │
 │                            │                                        │
 │                            ▼                                        │
 │       tracer's sample called to set act's trace flag                │
@@ -166,16 +177,16 @@ see pact and cact how parentActivity's context passed to childActivity.
 │  HostingApplication calls HostingApplicationDiagnostics.RequestEnd  │
 │                            │                                        │
 │                            ▼                                        │
-│             HttpInListener.OnStopActivity called                    │
-│                            │                                        │
-│                            ▼                                        │
+│             HttpInListener.OnStopActivity called                    │   HttpInListener.OnStopActivity called ─► activity stopped ─► tracerListener's ActivityStopped called
+│                            │                                        │                                          compared to
+│                            ▼                                        │   activity started ─► tracerListener's ActivityStarted called ─► HttpInListener.OnStartActivity called
 │             EnrichWithHttpResponse invoked                          │
 │                            │                                        │
 │                            ▼                                        │
-│     act stopped by HostingApplicationDiagnostics.RequestEnd         │
+│     act stopped by HostingApplicationDiagnostics.RequestEnd         │   
 │                            │                                        │
 │                            ▼                                        │
-│          tracerListener's ActivityStopped called                    │
+│          tracerListener's ActivityStopped called                    │   
 │                            │                                        │
 │                            ▼                                        │
 │            BatchExportProcessor.OnEnd called                        │
@@ -204,6 +215,65 @@ see pact and cact how parentActivity's context passed to childActivity.
       │ └────────────┘ │       │ └─────────┘ │        │ └───────────┘ │
       │    ...         │       │    ...      │        │    ...        │
       └────────────────┘       └─────────────┘        └───────────────┘
+
+
+```yml
+# otel-collector-config.yml for OpenTelemetry Collector
+receivers:
+  docker_stats:
+    api_version: 1.41
+    env_vars_to_metric_labels:
+      OTEL_SERVICE_NAME: service.name
+  otlp:
+    protocols:
+      http:
+      grpc:
+
+exporters:
+  jaeger:
+    endpoint: jaeger:14250
+    tls:
+      insecure: true
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+    resource_to_telemetry_conversion:
+      enabled: true
+  logging:
+    verbosity: detailed
+
+processors:
+  batch:
+  resourcedetection/docker:
+    detectors: [env, docker]
+  tail_sampling:
+    decision_wait: 2s
+    expected_new_traces_per_sec: 500
+    policies:
+      [
+        {
+          name: limit-rate,
+          type: rate_limiting,
+          rate_limiting: {spans_per_second: 50}
+        }
+      ]
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [tail_sampling, batch, resourcedetection/docker]
+      exporters: [jaeger]
+    metrics:
+      receivers: [docker_stats, otlp]
+      processors: [batch, resourcedetection/docker]
+      exporters: [prometheus]
+    logs:
+      receivers: [otlp]
+      processors: [batch, resourcedetection/docker]
+      exporters: [logging]
+```
+
+
+
 
 Let's revisit how asp.net create an activity for incoming request:
 
@@ -278,16 +348,7 @@ internal sealed class HostingApplicationDiagnostics
 you can see that for BeginRequest, `StartActivity` calls before `RecordBeginRequestDiagnostics`, while for RequestEnd, the order is different, `RecordEndRequestDiagnostics` get called before `StopActivity`, that why the process.OnStart received an unenriched acitivity while process.OnEnd will received an full enriched acitivity.
 
 
-Another question is why we need `HttpInListener` when we already can use `TracerProviderSdk.listener` can react when activity is started? The reason is `HttpInListener` can recieve both `Activity` and `HttpContext`, you can further enrich the activity with HttpContext, for example, don't enrich activity is the http request is a static file request
-
-
-## W3C Trace Context
-
-`traceparent: {version}-{trace-id}-{parent-span-id}-{sampling-state}`
-
-`b3: {trace-id}-{span-id}-{sampling-state}-{parent-span-id}` 
-{parent-span-id} is optional for root span OpenTelemetry and .NET ignore {parent-span-id}
-Service A ──►  b3: abc123-11111111-1 ──► Service B ──► abc123-22222222-1-11111111 ──► Service C ──► abc123-33333333-1-22222222 ──► Downstream Services
+you might ask why we need `HttpInListener` when we already can use `TracerProviderSdk.listener` can react when activity is started? The reason is `TracerProviderSdk.listener` "receives" Activity instance, while `HttpInListener` can recieve `HttpContext` (it access current activity using `Activity.Current`), you can combine Activity with HttpContext to further enrich the activity, for example, don't enrich activity is the http request is a static file request
 
 
 
@@ -347,7 +408,7 @@ public sealed class ParentBasedSampler : Sampler
 
         this.remoteParentSampled = new AlwaysOnSampler();
         this.remoteParentNotSampled = new AlwaysOffSampler();
-        this.localParentSampled = new AlwaysOnSampler();  // <-----------------
+        this.localParentSampled = new AlwaysOnSampler();  // <----------------------------
         this.localParentNotSampled = new AlwaysOffSampler();
     }
 
@@ -400,6 +461,175 @@ void ConfigureProbabilitySampler(WebApplicationBuilder builder)
 
 you might ask how can child activity and parent activity be consistent, how can it prevent parent activity sampled in but child activity sampled out since the ratio means random, but this won't happen because `TraceIdRatioBasedSampler` purely use trace id to calculate the probability, since trace id is passed from parent activity to child activity, so the decisions alwasy match, i.e if parent activity is sampled in then child activities are also sampled in. So the only thing decide the final sampling decision is the trace id genereated by the parent activiy in the first place.
 
+
+## Resource
+
+In OpenTelemetry .NET, a **Resource** is a set of key-value attributes that describe the entity for which telemetry is collected. Resources provide context about the application or service, such as its name, version, environment, and other identifying information.
+
+### Key Points
+
+- **Resource** is not attached to individual spans/activities, but to the telemetry pipeline as a whole.
+- It describes the service (e.g., `service.name`, `service.version`, `service.namespace`), environment (e.g., `env`), and other metadata.
+- Resources are configured via `ResourceBuilder` when setting up OpenTelemetry:
+- Resources are merged from multiple sources (environment variables, code, detectors).
+- Exporters (like Jaeger, OTLP) use resource attributes to annotate telemetry data, making it easier to filter and analyze in observability backends.
+
+**Example resource attributes:**
+- `service.name`: Name of the service (e.g., "myService")
+- `service.version`: Version of the service
+- `env`: Environment (e.g., "Production")
+- `telemetry.sdk.name`: "opentelemetry"
+- `service.instance.id`: Unique instance identifier
+
+**Summary:**  
+A Resource in OpenTelemetry .NET is metadata about the service or process emitting telemetry, used to provide context for traces, metrics, and logs.
+
+```C#
+static void ConfigureTelemetry(WebApplicationBuilder builder)
+{
+    var env = new KeyValuePair<string, object>("env", builder.Environment.EnvironmentName);
+    var resourceBuilder = ResourceBuilder.CreateDefault()
+        //.AddService("frontend", serviceNamespace: "memes", serviceVersion: "1.0.0") <--------this overides OTEL_SERVICE_NAME in appsettings.json
+        .AddAttributes(new []
+        {
+            new KeyValuePair<string, object>("service.version","1.0.0")   // <---------------AddService is just wrapper to call multiple AddAttributes
+        })                                                                
+        .AddAttributes(new[] { env });      
+    var samplingProbability = builder.Configuration.GetSection("Sampling").GetValue<double>("Probability");
+
+    builder.Services.AddOpenTelemetry()
+        .WithTracing(builder => builder
+            .SetSampler(new TraceIdRatioBasedSampler(samplingProbability))
+            .AddProcessor<MemeNameEnrichingProcessor>()
+            .SetResourceBuilder(resourceBuilder)
+        // ...      
+       
+}
+```
+
+```C#
+//-------------------V
+public class Resource
+{
+    public Resource(IEnumerable<KeyValuePair<string, object>> attributes)  { ... }
+    public IEnumerable<KeyValuePair<string, object>> Attributes { get; }
+
+    public Resource Merge(Resource other) { ... }
+}
+//-------------------Ʌ
+
+//-------------------------------------------------V
+internal sealed class OtelServiceNameEnvVarDetector : IResourceDetector
+{
+    public const string EnvVarKey = "OTEL_SERVICE_NAME";
+
+    private readonly IConfiguration configuration;
+
+    public OtelServiceNameEnvVarDetector(IConfiguration configuration)
+    {
+        this.configuration = configuration;
+    }
+
+    public Resource Detect()
+    {
+        var resource = Resource.Empty;
+
+        if (this.configuration.TryGetStringValue(EnvVarKey, out string? envResourceAttributeValue))
+        {
+            resource = new Resource(new Dictionary<string, object>
+            {
+                [ResourceSemanticConventions.AttributeServiceName] = envResourceAttributeValue,
+               // <--------------------------"service.name"
+            });
+        }
+
+        return resource;
+    }
+}
+//-------------------------------------------------Ʌ
+
+//-------------------------------------------V
+public static class ResourceBuilderExtensions
+{
+    // ...
+    public static ResourceBuilder AddAttributes(this ResourceBuilder resourceBuilder, IEnumerable<KeyValuePair<string, object>> attributes)  // <---------------
+    {
+        return resourceBuilder.AddResource(new Resource(attributes)); 
+    }
+}
+//-------------------------------------------Ʌ
+```
+
+```json
+// appsettings.json
+{
+    "OTEL_SERVICE_NAME": "myService"  // will be overridden by ResourceBuilder.AddService("frontend", ...)
+}
+```
+
+```yml
+Activity.TraceId:            dbb7d6e94349fbc688e958bf5390b00c
+Activity.SpanId:             528d47cc5e76079e
+Activity.TraceFlags:         Recorded
+Activity.DisplayName:        /
+Activity.Kind:               Server
+Activity.StartTime:          2025-06-08T12:56:09.5305830Z
+Activity.Duration:           00:00:00.3249234
+Activity.Tags:
+    net.host.name: localhost
+    net.host.port: 5051
+    http.method: GET
+    http.scheme: http
+    http.target: /
+    http.url: http://localhost:5051/
+    http.flavor: 1.1
+    http.user_agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36
+    http.status_code: 200
+Instrumentation scope (ActivitySource):
+    Name: Microsoft.AspNetCore
+Resource associated with Activity:
+    env: Production             ## <-------------------------------------
+    service.name: myService     ## <-------------------------------------
+    service.namespace: memes
+    service.version: 1.0.0
+    service.instance.id: 0fb32038-bf96-46ce-8742-2a8dda0c3738
+    ## ------------------------------V from rb1
+    telemetry.sdk.name: opentelemetry
+    telemetry.sdk.language: dotnet
+    telemetry.sdk.version: 1.12.0
+    ##-------------------------------Ʌ
+
+Activity.TraceId:            dbb7d6e94349fbc688e958bf5390b00c
+Activity.SpanId:             528d47cc5e76079e
+Activity.TraceFlags:         Recorded
+Activity.DisplayName:        /
+Activity.Kind:               Server
+Activity.StartTime:          2025-06-08T12:56:09.5305830Z
+Activity.Duration:           00:00:00.3249234
+Activity.Tags:
+    net.host.name: localhost
+    net.host.port: 5051
+    http.method: GET
+    http.scheme: http
+    http.target: /
+    http.url: http://localhost:5051/
+    http.flavor: 1.1
+    http.user_agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36
+    http.status_code: 200
+Instrumentation scope (ActivitySource):
+    Name: Microsoft.AspNetCore
+Resource associated with Activity:
+    env: Production             ## <-------------------------------------
+    service.name: myService     ## <-------------------------------------
+    service.namespace: memes
+    service.version: 1.0.0
+    service.instance.id: 0fb32038-bf96-46ce-8742-2a8dda0c3738
+    telemetry.sdk.name: opentelemetry
+    telemetry.sdk.language: dotnet
+    telemetry.sdk.version: 1.12.0
+```
+
+note that Activity doesn't contain any "resource related" tags, only exporter takes in Resource and show them in Console or APM backend, check rb4
 
 
 ## Processor

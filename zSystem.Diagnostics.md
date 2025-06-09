@@ -72,21 +72,31 @@ public class Activity : IDisposable  // In .NET world, a span is represented by 
     public ActivityTraceId TraceId { get; }   // <------------------------------
     public string? Id                       // <------------------------------
     {
-        get
-        {
-        // if we represented it as a traceId-spanId, convert it to a string.
-        // We can do this concatenation with a stackalloced Span<char> if we actually used Id a lot.
-        if (_id == null && _spanId != null)
-        {
-            // Convert flags to binary.
-            Span<char> flagsChars = stackalloc char[2];
-            HexConverter.ToCharsBuffer((byte)((~ActivityTraceFlagsIsSet) & _w3CIdFlags), flagsChars, 0, HexConverter.Casing.Lower);
-            string id =  "00-" + _traceId + "-" + _spanId + "-" + flagsChars.ToString();
-            Interlocked.CompareExchange(ref _id, id, null);
+        get {
+            // if we represented it as a traceId-spanId, convert it to a string.
+            // We can do this concatenation with a stackalloced Span<char> if we actually used Id a lot.
+            if (_id == null && _spanId != null)
+            {
+                // Convert flags to binary.
+                Span<char> flagsChars = stackalloc char[2];
+                HexConverter.ToCharsBuffer((byte)((~ActivityTraceFlagsIsSet) & _w3CIdFlags), flagsChars, 0, HexConverter.Casing.Lower);
+                string id =  "00-" + _traceId + "-" + _spanId + "-" + flagsChars.ToString();
+                Interlocked.CompareExchange(ref _id, id, null);
+            }
+            
+            return _id;
         }
-        
-        return _id;
+    }
+
+    public void Dispose()
+    {
+        if (!IsStopped)
+        {
+            Stop();
         }
+
+        Dispose(true);
+        GC.SuppressFinalize(this);
     }
 
     private static void SetCurrent(Activity? activity)
@@ -158,7 +168,7 @@ public class Activity : IDisposable  // In .NET world, a span is represented by 
             }
 
             if (IdFormat == ActivityIdFormat.W3C)
-                GenerateW3CId();   // <-------------------------pact3.2, cact3.3
+                GenerateW3CId();   // <-------------------------pact3.2, cact3.3, create spanId for _traceId
             else
                 _id = GenerateHierarchicalId();
 
@@ -284,7 +294,7 @@ public class Activity : IDisposable  // In .NET world, a span is represented by 
 
         // Create a new SpanID.
 
-        _spanId = ActivitySpanId.CreateRandom().ToHexString();
+        _spanId = ActivitySpanId.CreateRandom().ToHexString();  // <--------------------------
     }
 
     private bool TrySetTraceIdFromParent()  // <---------------------------this is how childActivity uses parents' traceId
@@ -308,6 +318,62 @@ public class Activity : IDisposable  // In .NET world, a span is represented by 
     }
 
     public bool Recorded { get => (ActivityTraceFlags & ActivityTraceFlags.Recorded) != 0; }
+
+    public Activity SetStatus(ActivityStatusCode code, string? description = null)
+    {
+        _statusCode = code;
+        _statusDescription = code == ActivityStatusCode.Error ? description : null;
+        return this;
+    }
+
+    public Activity AddException(Exception exception, in TagList tags = default, DateTimeOffset timestamp = default)
+    {
+        TagList exceptionTags = tags;
+
+        Source.NotifyActivityAddException(this, exception, ref exceptionTags);
+
+        const string ExceptionEventName = "exception";
+        const string ExceptionMessageTag = "exception.message";
+        const string ExceptionStackTraceTag = "exception.stacktrace";
+        const string ExceptionTypeTag = "exception.type";
+
+        bool hasMessage = false;
+        bool hasStackTrace = false;
+        bool hasType = false;
+
+        for (int i = 0; i < exceptionTags.Count; i++)
+        {
+            if (exceptionTags[i].Key == ExceptionMessageTag)
+            {
+                hasMessage = true;
+            }
+            else if (exceptionTags[i].Key == ExceptionStackTraceTag)
+            {
+                hasStackTrace = true;
+            }
+            else if (exceptionTags[i].Key == ExceptionTypeTag)
+            {
+                hasType = true;
+            }
+        }
+
+        if (!hasMessage)
+        {
+            exceptionTags.Add(new KeyValuePair<string, object?>(ExceptionMessageTag, exception.Message));
+        }
+
+        if (!hasStackTrace)
+        {
+            exceptionTags.Add(new KeyValuePair<string, object?>(ExceptionStackTraceTag, exception.ToString()));
+        }
+
+        if (!hasType)
+        {
+            exceptionTags.Add(new KeyValuePair<string, object?>(ExceptionTypeTag, exception.GetType().ToString()));
+        }
+
+        return AddEvent(new ActivityEvent(ExceptionEventName, timestamp, ref exceptionTags));
+    }
 
     internal static bool TryConvertIdToContext(string traceParent, string? traceState, bool isRemote, out ActivityContext context) // <---------------dlr3.2.2
     {
@@ -461,7 +527,7 @@ public sealed class ActivitySource : IDisposable
         return listeners != null && listeners.Count > 0;
     }
 
-    public Activity? StartActivity(string name = "", ActivityKind kind = ActivityKind.Internal)
+    public Activity? StartActivity([CallerMemberName] string name = "", ActivityKind kind = ActivityKind.Internal)
         => CreateActivity(name, kind, default, null, null, null, default);
 
     public Activity? StartActivity(            // <-------------------------pact1.0, cact1.0
@@ -477,6 +543,7 @@ public sealed class ActivitySource : IDisposable
     public Activity? CreateActivity(string name, ActivityKind kind, ActivityContext parentContext, IEnumerable<KeyValuePair<string, object?>>? tags = null,
                                     IEnumerable<ActivityLink>? links = null, ActivityIdFormat idFormat = ActivityIdFormat.Unknown)
         => CreateActivity(name, kind, parentContext, null, tags, links, default, startIt: false, idFormat);
+                                                                               // <-------- startIt is false by default because of StartActivity call directly
                                                                                      
     // <----------- even though this method is called CreateActivity, but it might not create a brand new activity depending on sampling result
     private Activity? CreateActivity(   // <------------------------pact1.1, cact1.1, dlr3.2.4.0
@@ -487,7 +554,7 @@ public sealed class ActivitySource : IDisposable
                                      IEnumerable<KeyValuePair<string, object?>>? tags,
                                      IEnumerable<ActivityLink>? links, 
                                      DateTimeOffset startTime, 
-                                     bool startIt = true,   // <-----------------
+                                     bool startIt = true, // <-----------------------------------
                                      ActivityIdFormat idFormat = ActivityIdFormat.Unknown
                                     )
     {
@@ -590,8 +657,8 @@ public sealed class ActivitySource : IDisposable
                 SampleActivity<ActivityContext>? sample = listener.Sample;
                 if (sample != null)
                 {
-                    ActivitySamplingResult dr = sample(ref data);  // <----------------sam, data is ActivityCreationOptions<ActivityContext>
-                                                                   // ihe Sampler is invoked for every span that is created, including when the parent span is not sampled
+                    ActivitySamplingResult dr = sample(ref data);  // <----------------sam, data is ActivityCreationOptions<ActivityContext>, check casr
+                                                                   // the Sampler is invoked for every span that is created, including when the parent span is not sampled
                     if (dr > result)
                     {
                         result = dr;
@@ -612,7 +679,7 @@ public sealed class ActivitySource : IDisposable
         if (samplingResult != ActivitySamplingResult.None)  // <---------sam, stop the creation of Activity if the sampler explicitly drop it by return SamplingDecision.Drop
         {                                                   // that's why ActivityListener.Sample doesn't take an parameter of Activity
             activity =  Activity.Create(this, name, kind, parentId, context, tags, links, startTime, samplerTags, samplingResult, startIt, idFormat, traceState); // dlr3.2.4.1
-                        // <-------------------------pact1.2., cact1.2.                   startIt is true by default
+                        // <-------------------------pact1.2., cact1.2.                   
         }
 
         return activity;
@@ -885,7 +952,7 @@ public readonly struct ActivityCreationOptions<T>
             if (Parent is ActivityContext && IdFormat == ActivityIdFormat.W3C && _context == default)
             {
                 Func<ActivityTraceId>? traceIdGenerator = Activity.TraceIdGenerator;
-                ActivityTraceId id = traceIdGenerator == null ? ActivityTraceId.CreateRandom() : traceIdGenerator();
+                ActivityTraceId id = traceIdGenerator == null ? ActivityTraceId.CreateRandom() : traceIdGenerator();  // <--------------------
 
                 // Because the struct is readonly, we cannot directly assign _context. We have to workaround it by calling Unsafe.AsRef
                 Unsafe.AsRef(in _context) = new ActivityContext(id, default, ActivityTraceFlags.None);
@@ -1021,6 +1088,13 @@ public readonly partial struct ActivityLink : IEquatable<ActivityLink>
     public Activity.Enumerator<KeyValuePair<string, object?>> EnumerateTagObjects() => new Activity.Enumerator<KeyValuePair<string, object?>>(_tags?.First);
 }
 //-----------------------------------------Ʌ
+
+public enum ActivityStatusCode
+{
+    Unset = 0,
+    Ok = 1, 
+    Error = 2
+}
 ```
 
 ```C#
