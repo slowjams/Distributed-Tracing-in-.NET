@@ -2389,7 +2389,7 @@ internal sealed class TracerProviderSdk : TracerProvider
             OpenTelemetrySdkEventSource.Log.TracerProviderSdkEvent($"Instrumentations added = \"{instrumentationFactoriesAdded}\".");
         }
 
-        var activityListener = new ActivityListener();  // <-----------------------tpsact
+        var activityListener = new ActivityListener();  // <-----------------------aact, tpsact
 
         if (this.supportLegacyActivity)
         {
@@ -2508,6 +2508,9 @@ internal sealed class TracerProviderSdk : TracerProvider
             }
             else
             {
+                /* 
+                   each call such as AddAspNetCoreInstrumentation() and AddHttpClientInstrumentation() add a source on TracerProviderBuilderSdk.Sources
+                */
                 var activitySources = new HashSet<string>(state.Sources, StringComparer.OrdinalIgnoreCase);  // <--------------------------acts
 
                 if (this.supportLegacyActivity)
@@ -5833,6 +5836,674 @@ public readonly struct SamplingParameters
 ```
 
 ===============================================================================
+
+
+```C#
+//-----------------------------V
+public static class Propagators
+{
+    private static readonly TextMapPropagator Noop = new NoopTextMapPropagator();
+
+    public static TextMapPropagator DefaultTextMapPropagator { get; internal set; } = Noop;
+
+    internal static void Reset()
+    {
+        DefaultTextMapPropagator = Noop;
+    }
+}
+//-----------------------------Ʌ
+
+//-------------------------------------V
+public abstract class TextMapPropagator
+{
+    public abstract ISet<string>? Fields { get; }
+
+    public abstract void Inject<T>(PropagationContext context, T carrier, Action<T, string, string> setter);
+
+    public abstract PropagationContext Extract<T>(PropagationContext context, T carrier, Func<T, string, IEnumerable<string>?> getter);
+}
+//-------------------------------------Ʌ
+
+//---------------------------------------V
+public readonly struct PropagationContext : IEquatable<PropagationContext>
+{
+    public PropagationContext(ActivityContext activityContext, Baggage baggage)
+    {
+        this.ActivityContext = activityContext;
+        this.Baggage = baggage;
+    }
+
+    public ActivityContext ActivityContext { get; }
+
+    public Baggage Baggage { get; }
+
+    public bool Equals(PropagationContext value)
+    {
+        return this.ActivityContext == value.ActivityContext && this.Baggage == value.Baggage;
+    }
+
+    // ...
+}
+//---------------------------------------Ʌ
+
+//-----------------------------------------V
+internal sealed class NoopTextMapPropagator : TextMapPropagator
+{
+    private static readonly PropagationContext DefaultPropagationContext = default;
+
+    public override ISet<string>? Fields => null;
+
+    public override PropagationContext Extract<T>(PropagationContext context, T carrier, Func<T, string, IEnumerable<string>?> getter)
+    {
+        return DefaultPropagationContext;
+    }
+
+    public override void Inject<T>(PropagationContext context, T carrier, Action<T, string, string> setter) { }
+}
+//-----------------------------------------Ʌ
+
+//-------------------------------------V
+public class CompositeTextMapPropagator : TextMapPropagator
+{
+    private readonly List<TextMapPropagator> propagators;
+    private readonly ISet<string> allFields;
+
+    public CompositeTextMapPropagator(IEnumerable<TextMapPropagator> propagators)
+    {
+        Guard.ThrowIfNull(propagators);
+
+        var propagatorsList = new List<TextMapPropagator>();
+
+        foreach (var propagator in propagators)
+        {
+            if (propagator is not null)
+            {
+                propagatorsList.Add(propagator);
+            }
+        }
+
+        this.propagators = propagatorsList;
+
+        // For efficiency, we resolve the fields from all propagators only once, as they are
+        // not expected to change (although the implementation doesn't strictly prevent that).
+        if (this.propagators.Count == 0)
+        {
+            // Use a new empty HashSet for each instance to avoid any potential mutation issues.
+            this.allFields = new HashSet<string>();
+        }
+        else
+        {
+            ISet<string>? fields = this.propagators[0].Fields;
+
+            var output = fields is not null
+                ? new HashSet<string>(fields)
+                : [];
+
+            for (int i = 1; i < this.propagators.Count; i++)
+            {
+                fields = this.propagators[i].Fields;
+                if (fields is not null)
+                {
+                    output.UnionWith(fields);
+                }
+            }
+
+            this.allFields = output;
+        }
+    }
+
+    public override ISet<string> Fields => this.allFields;
+
+    public override PropagationContext Extract<T>(PropagationContext context, T carrier, Func<T, string, IEnumerable<string>?> getter)
+    {
+        for (int i = 0; i < this.propagators.Count; i++)
+        {
+            context = this.propagators[i].Extract(context, carrier, getter);
+        }
+
+        return context;
+    }
+
+    public override void Inject<T>(PropagationContext context, T carrier, Action<T, string, string> setter)
+    {
+        for (int i = 0; i < this.propagators.Count; i++)
+        {
+            this.propagators[i].Inject(context, carrier, setter);
+        }
+    }
+}
+//-------------------------------------Ʌ
+
+//---------------------------------V
+public class TraceContextPropagator : TextMapPropagator
+{
+    private const string TraceParent = "traceparent";
+    private const string TraceState = "tracestate";
+
+    private const int TraceStateKeyMaxLength = 256;
+    private const int TraceStateKeyTenantMaxLength = 241;
+    private const int TraceStateKeyVendorMaxLength = 14;
+    private const int TraceStateValueMaxLength = 256;
+
+    private static readonly int VersionPrefixIdLength = "00-".Length;
+    private static readonly int TraceIdLength = "0af7651916cd43dd8448eb211c80319c".Length;
+    private static readonly int VersionAndTraceIdLength = "00-0af7651916cd43dd8448eb211c80319c-".Length;
+    private static readonly int SpanIdLength = "00f067aa0ba902b7".Length;
+    private static readonly int VersionAndTraceIdAndSpanIdLength = "00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-".Length;
+    private static readonly int OptionsLength = "00".Length;
+    private static readonly int TraceparentLengthV0 = "00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-00".Length;
+
+    public override ISet<string> Fields => new HashSet<string> { TraceState, TraceParent };
+
+    public override PropagationContext Extract<T>(PropagationContext context, T carrier, Func<T, string, IEnumerable<string>?> getter)
+    {
+        if (context.ActivityContext.IsValid())
+        {
+            // if a valid context has already been extracted, perform a noop.
+            return context;
+        }
+
+        if (carrier == null)
+        {
+            OpenTelemetryApiEventSource.Log.FailedToExtractActivityContext(nameof(TraceContextPropagator), "null carrier");
+            return context;
+        }
+
+        if (getter == null)
+        {
+            OpenTelemetryApiEventSource.Log.FailedToExtractActivityContext(nameof(TraceContextPropagator), "null getter");
+            return context;
+        }
+
+        try
+        {
+            var traceparentCollection = getter(carrier, TraceParent);
+
+            // There must be a single traceparent
+            if (traceparentCollection == null || traceparentCollection.Count() != 1)
+            {
+                return context;
+            }
+
+            var traceparent = traceparentCollection.First();
+            var traceparentParsed = TryExtractTraceparent(traceparent, out var traceId, out var spanId, out var traceoptions);
+
+            if (!traceparentParsed)
+            {
+                return context;
+            }
+
+            string? tracestate = null;
+            var tracestateCollection = getter(carrier, TraceState);
+            if (tracestateCollection?.Any() ?? false)
+            {
+                TryExtractTracestate([.. tracestateCollection], out tracestate);
+            }
+
+            return new PropagationContext(
+                new ActivityContext(traceId, spanId, traceoptions, tracestate, isRemote: true),
+                context.Baggage);
+        }
+        catch (Exception ex)
+        {
+            OpenTelemetryApiEventSource.Log.ActivityContextExtractException(nameof(TraceContextPropagator), ex);
+        }
+
+        // in case of exception indicate to upstream that there is no parseable context from the top
+        return context;
+    }
+
+    public override void Inject<T>(PropagationContext context, T carrier, Action<T, string, string> setter)
+    {
+        if (context.ActivityContext.TraceId == default || context.ActivityContext.SpanId == default)
+        {
+            OpenTelemetryApiEventSource.Log.FailedToInjectActivityContext(nameof(TraceContextPropagator), "Invalid context");
+            return;
+        }
+
+        if (carrier == null)
+        {
+            OpenTelemetryApiEventSource.Log.FailedToInjectActivityContext(nameof(TraceContextPropagator), "null carrier");
+            return;
+        }
+
+        if (setter == null)
+        {
+            OpenTelemetryApiEventSource.Log.FailedToInjectActivityContext(nameof(TraceContextPropagator), "null setter");
+            return;
+        }
+
+        var traceparent = string.Concat("00-", context.ActivityContext.TraceId.ToHexString(), "-", context.ActivityContext.SpanId.ToHexString());
+        traceparent = string.Concat(traceparent, (context.ActivityContext.TraceFlags & ActivityTraceFlags.Recorded) != 0 ? "-01" : "-00");
+
+        setter(carrier, TraceParent, traceparent);
+
+        string? tracestateStr = context.ActivityContext.TraceState;
+        if (tracestateStr?.Length > 0)
+        {
+            setter(carrier, TraceState, tracestateStr);
+        }
+    }
+
+    internal static bool TryExtractTraceparent(string traceparent, out ActivityTraceId traceId, out ActivitySpanId spanId, out ActivityTraceFlags traceOptions)
+    {
+        // from https://github.com/w3c/distributed-tracing/blob/master/trace_context/HTTP_HEADER_FORMAT.md
+        // traceparent: 00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-01
+
+        traceId = default;
+        spanId = default;
+        traceOptions = default;
+        var bestAttempt = false;
+
+        if (string.IsNullOrWhiteSpace(traceparent) || traceparent.Length < TraceparentLengthV0)
+        {
+            return false;
+        }
+
+        // if version does not end with delimiter
+        if (traceparent[VersionPrefixIdLength - 1] != '-')
+        {
+            return false;
+        }
+
+        // or version is not a hex (will throw)
+        var version0 = HexCharToByte(traceparent[0]);
+        var version1 = HexCharToByte(traceparent[1]);
+
+        if (version0 == 0xf && version1 == 0xf)
+        {
+            return false;
+        }
+
+        if (version0 > 0)
+        {
+            // expected version is 00
+            // for higher versions - best attempt parsing of trace id, span id, etc.
+            bestAttempt = true;
+        }
+
+        if (traceparent[VersionAndTraceIdLength - 1] != '-')
+        {
+            return false;
+        }
+
+        try
+        {
+            traceId = ActivityTraceId.CreateFromString(traceparent.AsSpan().Slice(VersionPrefixIdLength, TraceIdLength));
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            // it's ok to still parse tracestate
+            return false;
+        }
+
+        if (traceparent[VersionAndTraceIdAndSpanIdLength - 1] != '-')
+        {
+            return false;
+        }
+
+        byte optionsLowByte;
+        try
+        {
+            spanId = ActivitySpanId.CreateFromString(traceparent.AsSpan().Slice(VersionAndTraceIdLength, SpanIdLength));
+            _ = HexCharToByte(traceparent[VersionAndTraceIdAndSpanIdLength]); // to verify if there is no bad chars on options position
+            optionsLowByte = HexCharToByte(traceparent[VersionAndTraceIdAndSpanIdLength + 1]);
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            // it's ok to still parse tracestate
+            return false;
+        }
+
+        if ((optionsLowByte & 1) == 1)
+        {
+            traceOptions |= ActivityTraceFlags.Recorded;
+        }
+
+        if ((!bestAttempt) && (traceparent.Length != VersionAndTraceIdAndSpanIdLength + OptionsLength))
+        {
+            return false;
+        }
+
+        if (bestAttempt)
+        {
+            if ((traceparent.Length > TraceparentLengthV0) && (traceparent[TraceparentLengthV0] != '-'))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    internal static bool TryExtractTracestate(string[] tracestateCollection, out string tracestateResult)
+    {
+        tracestateResult = string.Empty;
+
+        if (tracestateCollection != null)
+        {
+            var keySet = new HashSet<string>();
+            var result = new StringBuilder();
+            for (int i = 0; i < tracestateCollection.Length; ++i)
+            {
+                var tracestate = tracestateCollection[i].AsSpan();
+                int begin = 0;
+                while (begin < tracestate.Length)
+                {
+                    int length = tracestate.Slice(begin).IndexOf(',');
+                    ReadOnlySpan<char> listMember;
+                    if (length != -1)
+                    {
+                        listMember = tracestate.Slice(begin, length).Trim();
+                        begin += length + 1;
+                    }
+                    else
+                    {
+                        listMember = tracestate.Slice(begin).Trim();
+                        begin = tracestate.Length;
+                    }
+
+                    if (listMember.IsEmpty)
+                    {
+                        // Empty and whitespace - only list members are allowed.
+                        // Vendors MUST accept empty tracestate headers but SHOULD avoid sending them.
+                        continue;
+                    }
+
+                    if (keySet.Count >= 32)
+                    {
+                        return false;
+                    }
+
+                    int keyLength = listMember.IndexOf('=');
+                    if (keyLength == listMember.Length || keyLength == -1)
+                    {
+                        // Missing key or value in tracestate
+                        return false;
+                    }
+
+                    var key = listMember.Slice(0, keyLength);
+                    if (!ValidateKey(key))
+                    {
+                        // test_tracestate_key_illegal_characters in https://github.com/w3c/trace-context/blob/master/test/test.py
+                        // test_tracestate_key_length_limit
+                        // test_tracestate_key_illegal_vendor_format
+                        return false;
+                    }
+
+                    var value = listMember.Slice(keyLength + 1);
+                    if (!ValidateValue(value))
+                    {
+                        // test_tracestate_value_illegal_characters
+                        return false;
+                    }
+
+                    // ValidateKey() call above has ensured the key does not contain upper case letters.
+                    if (!keySet.Add(key.ToString()))
+                    {
+                        // test_tracestate_duplicated_keys
+                        return false;
+                    }
+
+                    if (result.Length > 0)
+                    {
+                        result.Append(',');
+                    }
+
+                    result.Append(listMember);
+                }
+            }
+
+            tracestateResult = result.ToString();
+        }
+
+        return true;
+    }
+
+    private static byte HexCharToByte(char c)
+    {
+        if ((c >= '0') && (c <= '9'))
+            return (byte)(c - '0');
+
+        if ((c >= 'a') && (c <= 'f'))
+            return (byte)(c - 'a' + 10);
+
+        throw new ArgumentOutOfRangeException(nameof(c), c, "Must be within: [0-9] or [a-f]");
+    }
+
+    private static bool ValidateKey(ReadOnlySpan<char> key)
+    {
+        if (key.Length <= 0 || key.Length > TraceStateKeyMaxLength)
+        {
+            return false;
+        }
+
+        if (!IsLowerAlphaDigit(key[0]))
+        {
+            return false;
+        }
+
+        int tenantLength = -1;
+        for (int i = 1; i < key.Length; ++i)
+        {
+            char ch = key[i];
+            if (ch == '@')
+            {
+                tenantLength = i;
+                break;
+            }
+
+            if (!(IsLowerAlphaDigit(ch) || ch == '_' || ch == '-' || ch == '*' || ch == '/'))
+                return false;
+        }
+
+        if (tenantLength == -1)
+        {
+            // There is no "@" sign. The key follow the first format.
+            return true;
+        }
+
+        if (tenantLength == 0 || tenantLength > TraceStateKeyTenantMaxLength)
+        {
+            return false;
+        }
+
+        int vendorLength = key.Length - tenantLength - 1;
+        if (vendorLength == 0 || vendorLength > TraceStateKeyVendorMaxLength)
+        {
+            return false;
+        }
+
+        for (int i = tenantLength + 1; i < key.Length; ++i)
+        {
+            char ch = key[i];
+            if (!(IsLowerAlphaDigit(ch) || ch == '_' || ch == '-' || ch == '*' || ch == '/'))
+                return false;
+        }
+
+        return true;
+    }
+
+    private static bool ValidateValue(ReadOnlySpan<char> value)
+    {
+        if (value.Length <= 0 || value.Length > TraceStateValueMaxLength)
+            return false;
+
+        for (int i = 0; i < value.Length - 1; ++i)
+        {
+            char c = value[i];
+            if (!(c >= 0x20 && c <= 0x7E && c != 0x2C && c != 0x3D))
+            {
+                return false;
+            }
+        }
+
+        char last = value[value.Length - 1];
+        return last >= 0x21 && last <= 0x7E && last != 0x2C && last != 0x3D;
+    }
+
+    private static bool IsLowerAlphaDigit(char c) => (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z');
+   
+
+    private static void WriteTraceParentIntoSpan(Span<char> destination, ActivityContext context)
+    {
+        "00-".CopyTo(destination);
+        context.TraceId.ToHexString().CopyTo(destination.Slice(3));
+        destination[35] = '-';
+        context.SpanId.ToHexString().CopyTo(destination.Slice(36));
+        if ((context.TraceFlags & ActivityTraceFlags.Recorded) != 0)
+        {
+            "-01".CopyTo(destination.Slice(52));
+        }
+        else
+        {
+            "-00".CopyTo(destination.Slice(52));
+        }
+    }
+}
+//---------------------------------Ʌ
+
+//----------------------------V
+public class BaggagePropagator : TextMapPropagator
+{
+    internal const string BaggageHeaderName = "baggage";
+
+    private const int MaxBaggageLength = 8192;
+    private const int MaxBaggageItems = 180;
+
+    private static readonly char[] EqualSignSeparator = ['='];
+    private static readonly char[] CommaSignSeparator = [','];
+
+    public override ISet<string> Fields => new HashSet<string> { BaggageHeaderName };
+
+    public override PropagationContext Extract<T>(PropagationContext context, T carrier, Func<T, string, IEnumerable<string>?> getter)
+    {
+        if (context.Baggage != default)
+        {
+            // If baggage has already been extracted, perform a noop.
+            return context;
+        }
+
+        if (carrier == null)
+        {
+            OpenTelemetryApiEventSource.Log.FailedToExtractBaggage(nameof(BaggagePropagator), "null carrier");
+            return context;
+        }
+
+        if (getter == null)
+        {
+            OpenTelemetryApiEventSource.Log.FailedToExtractBaggage(nameof(BaggagePropagator), "null getter");
+            return context;
+        }
+
+        try
+        {
+            var baggageCollection = getter(carrier, BaggageHeaderName);
+            if (baggageCollection?.Any() ?? false)
+            {
+                if (TryExtractBaggage([.. baggageCollection], out var baggage))
+                {
+                    return new PropagationContext(context.ActivityContext, new Baggage(baggage!));
+                }
+            }
+
+            return new PropagationContext(context.ActivityContext, context.Baggage);
+        }
+        catch (Exception ex)
+        {
+            OpenTelemetryApiEventSource.Log.BaggageExtractException(nameof(BaggagePropagator), ex);
+        }
+
+        return context;
+    }
+
+    public override void Inject<T>(PropagationContext context, T carrier, Action<T, string, string> setter)
+    {
+        if (carrier == null)
+        {
+            OpenTelemetryApiEventSource.Log.FailedToInjectBaggage(nameof(BaggagePropagator), "null carrier");
+            return;
+        }
+
+        if (setter == null)
+        {
+            OpenTelemetryApiEventSource.Log.FailedToInjectBaggage(nameof(BaggagePropagator), "null setter");
+            return;
+        }
+
+        using var e = context.Baggage.GetEnumerator();
+
+        if (e.MoveNext() == true)
+        {
+            int itemCount = 0;
+            StringBuilder baggage = new StringBuilder();
+            do
+            {
+                KeyValuePair<string, string> item = e.Current;
+                if (string.IsNullOrEmpty(item.Value))
+                {
+                    continue;
+                }
+
+                baggage.Append(WebUtility.UrlEncode(item.Key)).Append('=').Append(WebUtility.UrlEncode(item.Value)).Append(',');
+            }
+            while (e.MoveNext() && ++itemCount < MaxBaggageItems && baggage.Length < MaxBaggageLength);
+            baggage.Remove(baggage.Length - 1, 1);
+            setter(carrier, BaggageHeaderName, baggage.ToString());
+        }
+    }
+
+    internal static bool TryExtractBaggage(string[] baggageCollection, out Dictionary<string, string>? baggage)
+    {
+        int baggageLength = -1;
+        bool done = false;
+        Dictionary<string, string>? baggageDictionary = null;
+
+        foreach (var item in baggageCollection)
+        {
+            if (done)
+                break;
+
+            if (string.IsNullOrEmpty(item))
+                continue;
+
+            foreach (var pair in item.Split(CommaSignSeparator))
+            {
+                baggageLength += pair.Length + 1; // pair and comma
+
+                if (baggageLength >= MaxBaggageLength || baggageDictionary?.Count >= MaxBaggageItems)
+                {
+                    done = true;
+                    break;
+                }
+
+                if (pair.IndexOf('=') < 0)
+                    continue;
+
+                var parts = pair.Split(EqualSignSeparator, 2);
+                if (parts.Length != 2)
+                    continue;
+
+                var key = WebUtility.UrlDecode(parts[0]);
+                var value = WebUtility.UrlDecode(parts[1]);
+
+                if (string.IsNullOrEmpty(key) || string.IsNullOrEmpty(value))
+                    continue;
+
+                baggageDictionary ??= [];
+
+                baggageDictionary[key] = value;
+            }
+        }
+
+        baggage = baggageDictionary;
+        return baggageDictionary != null;
+    }
+}
+//----------------------------Ʌ
+```
+
+================================================================================
 
 ```C#
 //------------------------------------------V

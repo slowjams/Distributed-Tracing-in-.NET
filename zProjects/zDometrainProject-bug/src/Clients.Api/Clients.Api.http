@@ -5,8 +5,8 @@ Accept: application/json
 Content-Type: application/json
 
 {
-  "name": "slowjams",
-  "email": "slowjams@random.com",
+  "name": "zzzzzzazznslowjamszzzzzz",
+  "email": "zzzzazzzzznzslowjamszzzzz@random.com",
   "membership": "Regular",
   "BirthDate": "1990-01-01"
 }

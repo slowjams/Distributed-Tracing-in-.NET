@@ -353,6 +353,8 @@ calls `HostingApplicationDiagnostics.BeginRequest(httpContext, ...)`
                     🠋 does two things in order
 a. `_activitySource(of "Microsoft.AspNetCore").CreateActivity("Microsoft.AspNetCore.Hosting.HttpRequestIn", ActivityKind.Server, context)` **which calls `TracerProviderSdk.listener`'s Sampler** (check important note below) ─►  `TracerProviderSdk.listener`'s delegate `ActivityListener.ActivityStarted` is invoked ─► `compositeProcessor?.OnStart(activity)` (normally `OnStart` does nothing)
 
+note that `TracerProviderSdk.listener` is created via `var activityListener = new ActivityListener()`, refer to `aact`
+
 b. `diagnosticSource(of "Microsoft.AspNetCore").Write("Microsoft.AspNetCore.Hosting.BeginRequest", new DeprecatedRequestData(httpContext, startTimestamp))`
   ─►  `HttpInListener.OnEventWritten(OnStartEvent)` (mainly to enrich the activity created above by calling multiple activity.SetTag(...))
                     🠋
@@ -764,38 +766,6 @@ Builder.Services.AddOpenTelemetry()
 
 static bool IsStaticFile(PathString requestPath) => requestPath.HasValue && (requestPath.Value.EndsWith(".js") ||  requestPath.Value.EndsWith(".css"));
 ```
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 ===========================================================================================

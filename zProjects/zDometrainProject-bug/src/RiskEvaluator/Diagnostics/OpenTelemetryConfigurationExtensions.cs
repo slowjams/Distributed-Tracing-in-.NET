@@ -1,15 +1,14 @@
 using System.Reflection;
-using Npgsql;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 
-namespace Clients.Api.Diagnostics;
+namespace RiskEvaluator.Diagnostics;
 
 public static class OpenTelemetryConfigurationExtensions
 {
     public static WebApplicationBuilder AddOpenTelemetry(this WebApplicationBuilder builder)
     {
-        const string serviceName = "Clients.Api";
+        const string serviceName = "RiskEvaluator";
 
         builder.Services.AddOpenTelemetry()
             .ConfigureResource(resource =>
@@ -25,15 +24,13 @@ public static class OpenTelemetryConfigurationExtensions
             .WithTracing(tracing =>
                 tracing
                     .AddAspNetCoreInstrumentation()
-                    .AddGrpcClientInstrumentation()
                     .AddHttpClientInstrumentation()
-                    .AddNpgsql()
-                    .AddRedisInstrumentation()
-                    // .AddConsoleExporter()
+                    .AddConsoleExporter()
+                    .AddSource("Tracing.NET")
                     .AddOtlpExporter(options => 
                         options.Endpoint = new Uri(builder.Configuration.GetValue<string>("Jaeger")!))
-                );
-        
+            );
+
         return builder;
     }
 }

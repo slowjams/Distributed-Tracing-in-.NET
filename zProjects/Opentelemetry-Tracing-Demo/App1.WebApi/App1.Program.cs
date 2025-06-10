@@ -24,12 +24,9 @@ namespace App1.WebApi
                     .SetResourceBuilder(ResourceBuilder.CreateDefault().AddService("App1"))
                     .AddOtlpExporter(opts =>
                     {
-                        opts.Protocol = OtlpExportProtocol.Grpc;
-                        opts.Endpoint = new Uri("http://localhost:4317");
-                        // not sure why author does this below, quite confusing
-                        //opts.Endpoint =
-                        //    new Uri(
-                        //        $"{builder.Configuration["Jaeger:Protocol"]}://{builder.Configuration["Jaeger:Host"]}:{builder.Configuration["Jaeger:Port"]}");
+                        opts.Endpoint =
+                            new Uri(
+                                $"{builder.Configuration["Jaeger:Protocol"]}://{builder.Configuration["Jaeger:Host"]}:{builder.Configuration["Jaeger:Port"]}");
                     });
             });
 
