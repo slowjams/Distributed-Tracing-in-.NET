@@ -7,10 +7,7 @@ namespace App1.WebApi.Controllers
 {
     [ApiController]
     [Route("http")]
-    public class CallApiController(
-        IHttpClientFactory httpClientFactory,
-        ILogger<CallApiController> logger)
-        : ControllerBase
+    public class CallApiController(IHttpClientFactory httpClientFactory, ILogger<CallApiController> logger): ControllerBase
     {
         [HttpGet]
         public async Task<IActionResult> Get()

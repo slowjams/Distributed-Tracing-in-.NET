@@ -5853,17 +5853,6 @@ public static class Propagators
 }
 //-----------------------------Ʌ
 
-//-------------------------------------V
-public abstract class TextMapPropagator
-{
-    public abstract ISet<string>? Fields { get; }
-
-    public abstract void Inject<T>(PropagationContext context, T carrier, Action<T, string, string> setter);
-
-    public abstract PropagationContext Extract<T>(PropagationContext context, T carrier, Func<T, string, IEnumerable<string>?> getter);
-}
-//-------------------------------------Ʌ
-
 //---------------------------------------V
 public readonly struct PropagationContext : IEquatable<PropagationContext>
 {
@@ -5885,6 +5874,17 @@ public readonly struct PropagationContext : IEquatable<PropagationContext>
     // ...
 }
 //---------------------------------------Ʌ
+
+//-------------------------------------V
+public abstract class TextMapPropagator
+{
+    public abstract ISet<string>? Fields { get; }
+
+    public abstract void Inject<T>(PropagationContext context, T carrier, Action<T, string, string> setter);
+
+    public abstract PropagationContext Extract<T>(PropagationContext context, T carrier, Func<T, string, IEnumerable<string>?> getter);
+}
+//-------------------------------------Ʌ
 
 //-----------------------------------------V
 internal sealed class NoopTextMapPropagator : TextMapPropagator
@@ -6003,17 +6003,7 @@ public class TraceContextPropagator : TextMapPropagator
             return context;
         }
 
-        if (carrier == null)
-        {
-            OpenTelemetryApiEventSource.Log.FailedToExtractActivityContext(nameof(TraceContextPropagator), "null carrier");
-            return context;
-        }
-
-        if (getter == null)
-        {
-            OpenTelemetryApiEventSource.Log.FailedToExtractActivityContext(nameof(TraceContextPropagator), "null getter");
-            return context;
-        }
+        // ...
 
         try
         {

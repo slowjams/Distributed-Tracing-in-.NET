@@ -34,8 +34,7 @@ namespace App1.WebApi
             {
                 c.BaseAddress = new Uri(builder.Configuration["App3Endpoint"]!);
                 c.Timeout = TimeSpan.FromSeconds(15);
-                c.DefaultRequestHeaders.Add(
-                    "accept", "application/json");
+                c.DefaultRequestHeaders.Add("accept", "application/json");
             });
 
             var app = builder.Build();

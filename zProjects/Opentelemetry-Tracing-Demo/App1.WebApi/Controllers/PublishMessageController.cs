@@ -32,7 +32,7 @@ namespace App1.WebApi.Controllers
                     using (var connection = factory.CreateConnection())
                     using (var channel = connection.CreateModel())
                     {
-                        var props = channel.CreateBasicProperties();
+                        IBasicProperties props = channel.CreateBasicProperties();
 
                         AddActivityToHeader(activity, props);
 

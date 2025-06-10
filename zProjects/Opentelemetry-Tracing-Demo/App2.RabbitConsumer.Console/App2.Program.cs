@@ -78,9 +78,7 @@ namespace App2.RabbitConsumer.Console
 
         }
 
-        private static async Task ProcessMessage(BasicDeliverEventArgs ea,
-            HttpClient httpClient,
-            IModel rabbitMqChannel)
+        private static async Task ProcessMessage(BasicDeliverEventArgs ea, HttpClient httpClient, IModel rabbitMqChannel)
         {
             try
             {
@@ -96,7 +94,7 @@ namespace App2.RabbitConsumer.Console
 
                     _logger.LogInformation("Message Received: " + message);
 
-                    _ = await httpClient.PostAsync("/sql-to-event",
+                    _ = await httpClient.PostAsync("/sql-to-event",  // <------------------------------this is the endpoint in App3
                         new StringContent(JsonSerializer.Serialize(message),
                             Encoding.UTF8,
                             "application/json"));
@@ -182,7 +180,8 @@ namespace App2.RabbitConsumer.Console
                         new Uri(
                             $"{_configuration["Jaeger:Protocol"]}://{_configuration["Jaeger:Host"]}:{_configuration["Jaeger:Port"]}");
                 })
-                .Build();
+                .Build();  // <-----------Build() creates a `new TracerProviderSdk()` which creates an ActivityListener,
+                           // Build() is not requred for web api as above because TelemetryHostedService does the job
         }
 
     }

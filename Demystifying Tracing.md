@@ -536,7 +536,7 @@ you might ask how can child activity and parent activity be consistent, how can 
 
 ## Resource
 
-In OpenTelemetry .NET, a **Resource** is a set of key-value attributes that describe the entity for which telemetry is collected. Resources provide context about the application or service, such as its name, version, environment, and other identifying information.
+In OpenTelemetry .NET, a **Resource** is the immutable representation of the entity producing the telemetry. It is a set of key-value attributes that describe the entity for which telemetry is collected. Resources provide context about the application or service, such as its name, version, environment, and other identifying information.
 
 ### Key Points
 
@@ -765,6 +765,75 @@ Builder.Services.AddOpenTelemetry()
 );
 
 static bool IsStaticFile(PathString requestPath) => requestPath.HasValue && (requestPath.Value.EndsWith(".js") ||  requestPath.Value.EndsWith(".css"));
+```
+
+
+## Propagator
+
+```C#
+//-------------------------------------------------V
+public static class OpenTelemetryServicesExtensions
+{
+    public static OpenTelemetryBuilder AddOpenTelemetry(this IServiceCollection services)
+    {
+        if (!services.Any((ServiceDescriptor d) => d.ServiceType == typeof(IHostedService) && d.ImplementationType == typeof(TelemetryHostedService)))
+        {
+            services.Insert(0, ServiceDescriptor.Singleton<IHostedService, TelemetryHostedService>()); 
+        }
+
+        return new OpenTelemetryBuilder(services);  // <----------------------------prga1
+    }
+}
+//-------------------------------------------------Ʌ
+
+//--------------------------------------V
+public sealed class OpenTelemetryBuilder : IOpenTelemetryBuilder
+{
+    internal OpenTelemetryBuilder(IServiceCollection services)
+    {
+        services.AddOpenTelemetrySharedProviderBuilderServices();    // <------------------------prga2
+
+        this.Services = services;
+    }
+
+    // ...
+}
+//--------------------------------------Ʌ
+
+//--------------------------------------------------------------V
+internal static class ProviderBuilderServiceCollectionExtensions
+{
+    // ...
+    
+    public static IServiceCollection AddOpenTelemetrySharedProviderBuilderServices(this IServiceCollection services)
+    {
+        // accessing Sdk class is just to trigger its static ctor, which sets default Propagators and default Activity Id format
+        _ = Sdk.SuppressInstrumentation;  // <--------------------------------------------------------------------------------------prga3
+                                          
+        services!.AddOptions();
+
+        services!.TryAddSingleton<IConfiguration>(sp => new ConfigurationBuilder().AddEnvironmentVariables().Build());
+
+        return services!;
+    }
+}
+//--------------------------------------------------------------Ʌ
+
+public static class Sdk
+{
+    static Sdk()
+    {
+        Propagators.DefaultTextMapPropagator = new CompositeTextMapPropagator(new TextMapPropagator[]   // <------------------------------prga4
+        {
+            new TraceContextPropagator(),
+            new BaggagePropagator(),
+        });
+
+        Activity.DefaultIdFormat = ActivityIdFormat.W3C;
+        Activity.ForceDefaultIdFormat = true;
+        // ...
+    }
+}
 ```
 
 

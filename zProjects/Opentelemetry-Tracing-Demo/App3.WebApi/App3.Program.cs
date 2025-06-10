@@ -45,9 +45,9 @@ namespace App3.WebApi
             });
 
             app.MapPost("/sql-to-event", async ([FromBody] string message, 
-                                                                        ISqlRepository repository, 
-                                                                        IRabbitRepository eventPublisher, 
-                                                                        ILogger <Program> logger) =>
+                                                ISqlRepository repository, 
+                                                IRabbitRepository eventPublisher, 
+                                                ILogger <Program> logger) =>
             {
                 logger.LogTrace("You call sql save message endpoint");
                 if (!string.IsNullOrEmpty(message))
