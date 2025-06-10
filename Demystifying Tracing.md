@@ -272,7 +272,7 @@ service:
       exporters: [logging]
 ```
 
-There are 3 combinations between exporter and collector:
+There are 4 combinations between exporter and collector:
 
 1. `AddOtlpExporter`, otel collector NOT involved
 
