@@ -82,7 +82,7 @@ internal sealed class DiagnosticsHandler : HttpMessageHandlerStage
         DiagnosticListener diagnosticListener = s_diagnosticListener;
 
         Guid loggingRequestId = Guid.Empty;
-        Activity? activity = StartActivity(request);   // <-----------------at1.1, dcp
+        Activity? activity = StartActivity(request);   // <-----------------at1.1, dcp, TracerProviderSdk.listener.ActivityStarted is called
 
         if (activity is not null)
         {

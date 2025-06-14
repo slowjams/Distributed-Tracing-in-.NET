@@ -139,7 +139,7 @@ see pact and cact how parentActivity's context passed to childActivity.
 
 
 
-## How OpenTelemetry Fits in >NET
+## How OpenTelemetry Fits in .NET
 
                          .net app                                      
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -171,7 +171,7 @@ see pact and cact how parentActivity's context passed to childActivity.
 │  HostingApplication executes middlewares pipeline with HttpContext  │
 │                            │                                        │
 │                            ▼                                        │
-│                   request pipeline ends                             │
+│    request pipeline ends (Controller's Action method ends)          │
 │                            │                                        │
 │                            ▼                                        │
 │  HostingApplication calls HostingApplicationDiagnostics.RequestEnd  │
@@ -355,6 +355,29 @@ a. `_activitySource(of "Microsoft.AspNetCore").CreateActivity("Microsoft.AspNetC
 
 note that `TracerProviderSdk.listener` is created via `var activityListener = new ActivityListener()`, refer to `aact`
 
+```C#
+internal sealed class TracerProviderSdk : TracerProvider
+{
+    internal TracerProviderSdk(IServiceProvider serviceProvider, bool ownsServiceProvider)
+    {
+        // ...
+        var activityListener = new ActivityListener();  // <----------------------------this is the core
+
+        activityListener.ActivityStarted = activity =>
+        {              
+            // ...
+            this.processor?.OnStart(activity);   
+        };
+
+        activityListener.ActivityStopped = activity =>
+        {
+            // ...
+            this.processor?.OnEnd(activity);
+        };
+    }
+}
+```
+
 b. `diagnosticSource(of "Microsoft.AspNetCore").Write("Microsoft.AspNetCore.Hosting.BeginRequest", new DeprecatedRequestData(httpContext, startTimestamp))`
   ─►  `HttpInListener.OnEventWritten(OnStartEvent)` (mainly to enrich the activity created above by calling multiple activity.SetTag(...))
                     🠋
@@ -374,6 +397,7 @@ check samd to see how `activity.IsAllDataRequested` and `activity.ActivityTraceF
 also note a funny fact, even a HTTP request's trace-flags (sampling bit) is passed, the downstream service will still run the sampler, it is there when sampling bit is checked, the process is different to what you might think that why not just don't run sampler at all when it is sampled out, but asp.net wants to give you granular control on overall process so it still run sampler which you can add different logic there
 
 **it is important to note: `TracerProviderSdk.listener.Sample` is called inside `ActivitySource.CreateActivity()`**, the `SamplingDecision` will be mapped to e.g. `ActivitySamplingResult` so that when `Activity.Create(..., ActivitySamplingResult samplingResult, ...)` is called (inside `ActivitySource.CreateActivity()`), the samplingResult will be used to initialize the newly create Activity's `IsAllDataRequested` and  `ActivityTraceFlags`, so that when the Activity is started, `TracerProviderSdk.listener.ActivityStarted()` runs first, when sends Activity to `processor.OnStart(activity)` (note that processor's OnStart normally does nothing), which means that process firstly received an unenriched activity (see procenrih), then `HttpInListener.OnStartActivity()` runs, again `Activity.IsAllDataRequested` can influence its `EnrichWithHttpRequest`
+
 
 let's compare it with the stop of an activity, you will see why it has to be like this order and why stopping an activity is different than the starting an activity
 
@@ -420,7 +444,31 @@ internal sealed class HostingApplicationDiagnostics
 you can see that for BeginRequest, `StartActivity` calls before `RecordBeginRequestDiagnostics`, while for RequestEnd, the order is different, `RecordEndRequestDiagnostics` get called before `StopActivity`, that why the process.OnStart received an unenriched acitivity while process.OnEnd will received an full enriched acitivity.
 
 
-you might ask why we need `HttpInListener` when we already can use `TracerProviderSdk.listener` can react when activity is started? The reason is `TracerProviderSdk.listener` "receives" Activity instance, while `HttpInListener` can recieve `HttpContext` (it access current activity using `Activity.Current`), you can combine Activity with HttpContext to further enrich the activity, for example, don't enrich activity is the http request is a static file request
+You might ask why we need `HttpInListener` or `HttpHandlerDiagnosticListener` when we already can use `TracerProviderSdk.listener` can react when activity is started? The reason is `TracerProviderSdk.listener` "receives" Activity instance, and yes,  listener's OnStartActivity and OnStopActivity can be called accordingly, but we also want to have granular control to enrich the activity e.g. add http response code after the request is finished, which is the purpose of `EnrichWithHttpResponseMessage` or `EnrichWithHttpRequestMessage`, we cannot enrich them during creation or stop of the activity, that's why we need source control the timing to call `WriteDiagnosticEvent` which trigger `OnEventWritten` of `HttpInListener` and  `HttpHandlerDiagnosticListener`, now you see why there is a subtle difference:
+
+activity started ─► tracerListener's ActivityStarted called ─► HostingApplicationDiagnostics.WriteDiagnosticEvent ─► called HttpInListener.OnEventWritten (OnStartActivity)called
+                                                                **compared to**
+HostingApplicationDiagnostics.WriteDiagnosticEvent called ─► HttpInListener.OnEventWritten (OnStopActivity) called ─► activity stopped ─► tracerListener's ActivityStopped called
+                                                     
+also `HttpInListener` can recieve `HttpContext` (it access current activity using `Activity.Current`), you can combine Activity with HttpContext to further enrich the activity, for example, don't enrich activity is the http request is a static file request
+
+There is some interesting thing to note about the DisplayName of Activity that displayed on APM such as Jaeger:
+
+```bash
+App1 GET publish-message  # <------------root activity created by HostingApplicationDiagnostics 
+```
+but the activity's DisplayName should be `Microsoft.AspNetCore.Hosting.HttpRequestIn`, so why jaeger is showing "GET publish-message", check `sadn` you will see how `HttpInListener.OnStopActivity` change the DisplayName of the activity to "Request.Method + route"
+
+```bash
+App1 GET publish-message
+     |
+     ▼
+     App1 Post   # <-----------App1 uses HttpClient to post a request, this activity is created by HttpClient, but why is only showing "Post" without the route like root activity?
+```
+you exepct to see "App1 Post {Route}" as well, but there is no route in the activity's DisplayName, well, that is how it is, `HttpHandlerDiagnosticListener.OnStartActivity` does  
+change the DisplayName of the activity to be request.Method.Method only, and `HttpHandlerDiagnosticListener.OnStartActivity` doesn't change DisplayName of the activity like what 
+`HttpInListener.OnStopActivity` do. I think the reason is, route is represented as tag e.g `url.full: http://app1:8080/add-user`, so there is no point to add "add-user" to be part of DisplayName of the activity.
+So if you see "Appx GET xxx", you know this activity is root activity created by Host, and if you see "Appx GET", you know it is the activity created by HttpClient
 
 
 

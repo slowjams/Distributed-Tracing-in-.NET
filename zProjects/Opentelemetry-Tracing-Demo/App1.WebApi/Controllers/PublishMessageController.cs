@@ -13,12 +13,11 @@ namespace App1.WebApi.Controllers
 {
     [ApiController]
     [Route("publish-message")]
-    public class PublishMessageController(
-        ILogger<PublishMessageController> logger,
-        IConfiguration configuration)
-        : ControllerBase
+    public class PublishMessageController(ILogger<PublishMessageController> logger, IConfiguration configuration): ControllerBase
     {
         private static readonly ActivitySource Activity = new(nameof(PublishMessageController));
+
+        // OpenTelemetry does not yet have support for automatic RabbitMq trace correlation, so you have to do it manually via Propagators
         private static readonly TextMapPropagator Propagator = Propagators.DefaultTextMapPropagator;
 
         [HttpGet]
@@ -62,14 +61,18 @@ namespace App1.WebApi.Controllers
 
         private void AddActivityToHeader(Activity activity, IBasicProperties props)
         {
-            Propagator.Inject(new PropagationContext(activity.Context, Baggage.Current), props, InjectContextIntoHeader);
+            Propagator.Inject(      // <---------------------------------------------this is the key part for injecting context
+                new PropagationContext(activity.Context, Baggage.Current),
+                props, 
+                InjectContextIntoHeader);
+            
             activity?.SetTag("messaging.system", "rabbitmq");
             activity?.SetTag("messaging.destination_kind", "queue");
             activity?.SetTag("messaging.rabbitmq.queue", "sample");
         }
-
+                                                                   
         private void InjectContextIntoHeader(IBasicProperties props, string key, string value)
-        {
+        {                                                                // key can be "traceparent", "tracestate", "baggage" etc
             try
             {
                 props.Headers ??= new Dictionary<string, object>();

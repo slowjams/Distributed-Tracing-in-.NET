@@ -87,17 +87,16 @@ namespace App2.RabbitConsumer.Console
 
                 using (var activity = Activity.StartActivity("Process Message", ActivityKind.Consumer, parentContext.ActivityContext))
                 {
-
                     var body = ea.Body.ToArray();
                     var message = Encoding.UTF8.GetString(body);
                     AddActivityTags(activity);
 
                     _logger.LogInformation("Message Received: " + message);
 
-                    _ = await httpClient.PostAsync("/sql-to-event",  // <------------------------------this is the endpoint in App3
+                    await httpClient.PostAsync("/sql-to-event",  // <------------------------------this is the endpoint in App3
                         new StringContent(JsonSerializer.Serialize(message),
-                            Encoding.UTF8,
-                            "application/json"));
+                        Encoding.UTF8,
+                        "application/json"));
 
                     rabbitMqChannel.BasicAck(deliveryTag: ea.DeliveryTag, multiple: false);
                 }
@@ -108,7 +107,6 @@ namespace App2.RabbitConsumer.Console
                 _logger.LogError(ex, "There was an error processing the message");
             }
         }
-
 
         private static IEnumerable<string> ExtractTraceContextFromBasicProperties(IBasicProperties props, string key)
         {

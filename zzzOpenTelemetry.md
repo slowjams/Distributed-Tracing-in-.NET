@@ -1427,8 +1427,8 @@ internal sealed class HttpHandlerDiagnosticListener : ListenerHandler
                 return;
             }
 
-            HttpTagHelper.RequestDataHelper.SetActivityDisplayName(activity, request.Method.Method);
-
+            RequestMethodHelper.SetActivityDisplayName(activity, request.Method.Method);  // <-----------sadn, that's why APM like Jaeger shows "App1 Post" with Route
+                                                                                          // OnStopActivity will not set DisplayName neither
             if (!IsNet7OrGreater)
             {
                 ActivityInstrumentationHelper.SetActivitySourceProperty(activity, ActivitySource);
@@ -1437,7 +1437,7 @@ internal sealed class HttpHandlerDiagnosticListener : ListenerHandler
 
             if (!IsNet9OrGreater)
             {
-                HttpTagHelper.RequestDataHelper.SetHttpMethodTag(activity, request.Method.Method);
+                RequestMethodHelper.SetHttpMethodTag(activity, request.Method.Method);
 
                 if (request.RequestUri != null)
                 {
@@ -1693,7 +1693,7 @@ internal class HttpInListener : ListenerHandler
             }
 
             var path = (request.PathBase.HasValue || request.Path.HasValue) ? (request.PathBase + request.Path).ToString() : "/";
-            TelemetryHelper.RequestDataHelper.SetActivityDisplayName(activity, request.Method);
+            RequestMethodHelper.SetActivityDisplayName(activity, request.Method);
 
             if (request.Host.HasValue)
             {
@@ -1753,7 +1753,11 @@ internal class HttpInListener : ListenerHandler
             var routePattern = (context.Features.Get<IExceptionHandlerPathFeature>()?.Endpoint as RouteEndpoint ?? context.GetEndpoint() as RouteEndpoint)?.RoutePattern.RawText;
             if (!string.IsNullOrEmpty(routePattern))
             {
-                TelemetryHelper.RequestDataHelper.SetActivityDisplayName(activity, context.Request.Method, routePattern);
+                /*
+                  Jaeger shows e.g. "GET publish-message f771806" instead of "Microsoft.AspNetCore.Hosting.HttpRequestIn" becuase of this SetActivityDisplayName call
+                */
+                RequestMethodHelper.SetActivityDisplayName(activity, context.Request.Method, routePattern);  // <-----------------------------------------sadn
+                
                 activity.SetTag(SemanticConventions.AttributeHttpRoute, routePattern);  // <---------set tag:  http.route: /api/WeatherForecast/{city}
                                                                                         
             }
@@ -2237,7 +2241,7 @@ internal sealed class TracerProviderBuilderSdk : TracerProviderBuilder, ITracerP
 
     public TracerProviderBuilder SetSampler(Sampler sampler)
     {
-        this.Sampler = sampler;  // <----------------sam0.2.
+        this.Sampler = sampler;  // <-------------------------sam0.2.
 
         return this;
     }
@@ -2308,7 +2312,7 @@ internal sealed class TracerProviderSdk : TracerProvider
 
     private readonly List<object> instrumentations = [];
     private readonly ActivityListener listener; // <-------------------
-    private readonly Sampler sampler; // <-------------------
+    private readonly Sampler sampler; // <-----------------------------
     private readonly Action<Activity> getRequestedDataAction;
     private readonly bool supportLegacyActivity;
     private BaseProcessor<Activity>? processor;
@@ -2389,7 +2393,7 @@ internal sealed class TracerProviderSdk : TracerProvider
             OpenTelemetrySdkEventSource.Log.TracerProviderSdkEvent($"Instrumentations added = \"{instrumentationFactoriesAdded}\".");
         }
 
-        var activityListener = new ActivityListener();  // <-----------------------aact, tpsact
+        var activityListener = new ActivityListener();  // <-----------------------!!aact, tpsact
 
         if (this.supportLegacyActivity)
         {
@@ -2489,7 +2493,9 @@ internal sealed class TracerProviderSdk : TracerProvider
             activityListener.Sample = (ref ActivityCreationOptions<ActivityContext> options) =>      // <---------------------sam, sample is called at ActivitySource.StartActivity
                 !Sdk.SuppressInstrumentation ? ComputeActivitySamplingResult(ref options, this.sampler) : ActivitySamplingResult.None;
 
-            this.getRequestedDataAction = this.RunGetRequestedDataOtherSampler;
+            this.getRequestedDataAction = this.RunGetRequestedDataOtherSampler;  // this.getRequestedDataAction is for legcy activities not created by ActivitySource, 
+                                                                                 // the sampling decision cannot be made at creation time.
+                                                                                 //  Instead, it must be applied after the activity is started.
         }
 
         // sources can be null. This happens when user is only interested in InstrumentationLibraries  which do not depend on ActivitySources.
@@ -3999,7 +4005,7 @@ internal sealed class HttpHandlerDiagnosticListener : ListenerHandler
             return;
         }
 
-        HttpTagHelper.RequestDataHelper.SetActivityDisplayName(activity, request2.Method.Method);
+        RequestMethodHelper.SetActivityDisplayName(activity, request2.Method.Method);
         if (!IsNet7OrGreater)
         {
             ActivityInstrumentationHelper.SetActivitySourceProperty(activity, ActivitySource);
@@ -4008,7 +4014,7 @@ internal sealed class HttpHandlerDiagnosticListener : ListenerHandler
 
         if (!IsNet9OrGreater)
         {
-            HttpTagHelper.RequestDataHelper.SetHttpMethodTag(activity, request2.Method.Method);
+            RequestMethodHelper.SetHttpMethodTag(activity, request2.Method.Method);
             if (request2.RequestUri != null)
             {
                 activity.SetTag("server.address", request2.RequestUri.Host);
@@ -6045,33 +6051,16 @@ public class TraceContextPropagator : TextMapPropagator
 
     public override void Inject<T>(PropagationContext context, T carrier, Action<T, string, string> setter)
     {
-        if (context.ActivityContext.TraceId == default || context.ActivityContext.SpanId == default)
-        {
-            OpenTelemetryApiEventSource.Log.FailedToInjectActivityContext(nameof(TraceContextPropagator), "Invalid context");
-            return;
-        }
-
-        if (carrier == null)
-        {
-            OpenTelemetryApiEventSource.Log.FailedToInjectActivityContext(nameof(TraceContextPropagator), "null carrier");
-            return;
-        }
-
-        if (setter == null)
-        {
-            OpenTelemetryApiEventSource.Log.FailedToInjectActivityContext(nameof(TraceContextPropagator), "null setter");
-            return;
-        }
-
+        // ...
         var traceparent = string.Concat("00-", context.ActivityContext.TraceId.ToHexString(), "-", context.ActivityContext.SpanId.ToHexString());
         traceparent = string.Concat(traceparent, (context.ActivityContext.TraceFlags & ActivityTraceFlags.Recorded) != 0 ? "-01" : "-00");
 
-        setter(carrier, TraceParent, traceparent);
+        setter(carrier, "traceparent", traceparent);
 
         string? tracestateStr = context.ActivityContext.TraceState;
         if (tracestateStr?.Length > 0)
         {
-            setter(carrier, TraceState, tracestateStr);
+            setter(carrier, "tracestate", tracestateStr);
         }
     }
 
