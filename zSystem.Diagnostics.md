@@ -1361,142 +1361,10 @@ internal sealed class W3CPropagator : DistributedContextPropagator
 
 ================================================================================================================================================
 
+
 ## Metrics
 
 ```C#
-//------------------------------V
-public abstract class Instrument
-{
-    internal static KeyValuePair<string, object?>[] EmptyTags => Array.Empty<KeyValuePair<string, object?>>();
-
-    internal static object SyncObject { get; } = new object();
-
-    internal readonly DiagLinkedList<ListenerSubscription> _subscriptions = new DiagLinkedList<ListenerSubscription>();
-
-    protected Instrument(Meter meter, string name) : this(meter, name, unit: null, description: null, tags: null) { }
-    protected Instrument(Meter meter, string name, string? unit, string? description) : this(meter, name, unit, description, tags: null) { }
-
-    protected Instrument(
-        Meter meter,
-        string name,
-        string? unit = default,
-        string? description = default,
-        IEnumerable<KeyValuePair<string, object?>>? tags = default)
-    {
-        Meter = meter ?? throw new ArgumentNullException(nameof(meter));
-        Name = name ?? throw new ArgumentNullException(nameof(name));
-        Description = description;
-        Unit = unit;
-        if (tags is not null)
-        {
-            var tagList = new List<KeyValuePair<string, object?>>(tags);
-            tagList.Sort((left, right) => string.Compare(left.Key, right.Key, StringComparison.Ordinal));
-            Tags = tagList;
-        }
-    }
-
-    protected void Publish()
-    {
-        // All instruments call Publish when they are created. We don't want to publish the instrument if the Meter is not supported.
-        if (!Meter.IsSupported)
-        {
-            return;
-        }
-
-        List<MeterListener>? allListeners = null;
-        lock (Instrument.SyncObject)
-        {
-            if (Meter.Disposed || !Meter.AddInstrument(this))
-            {
-                return;
-            }
-
-            allListeners = MeterListener.GetAllListeners();
-        }
-
-        if (allListeners is not null)
-        {
-            foreach (MeterListener listener in allListeners)
-            {
-                listener.InstrumentPublished?.Invoke(this, listener);
-            }
-        }
-    }
-
-    public Meter Meter { get; }
-
-    public string Name { get; }
-
-    public string? Description { get; }
-
-    public string? Unit { get; }
-
-    public IEnumerable<KeyValuePair<string, object?>>? Tags { get; }
-
-    public bool Enabled => _subscriptions.First is not null;
-
-    public virtual bool IsObservable => false;
-
-    internal void NotifyForUnpublishedInstrument()  // NotifyForUnpublishedInstrument is called from Meter.Dispose()
-    {
-        DiagNode<ListenerSubscription>? current = _subscriptions.First;
-        while (current is not null)
-        {
-            current.Value.Listener.DisableMeasurementEvents(this);
-            current = current.Next;
-        }
-
-        _subscriptions.Clear();
-    }
-
-    internal static void ValidateTypeParameter<T>()
-    {
-        Type type = typeof(T);
-        if (type != typeof(byte) && type != typeof(short) && type != typeof(int) && type != typeof(long) &&
-            type != typeof(double) && type != typeof(float) && type != typeof(decimal))
-        {
-            throw new InvalidOperationException(SR.Format(SR.UnsupportedType, type));
-        }
-    }
-
-   
-    internal object? EnableMeasurement(ListenerSubscription subscription, out bool oldStateStored)   // called from MeterListener.EnableMeasurementEvents
-    {
-        oldStateStored = false;
-
-        if (!_subscriptions.AddIfNotExist(subscription, (s1, s2) => object.ReferenceEquals(s1.Listener, s2.Listener)))
-        {
-            ListenerSubscription oldSubscription = _subscriptions.Remove(subscription, (s1, s2) => object.ReferenceEquals(s1.Listener, s2.Listener));
-            _subscriptions.AddIfNotExist(subscription, (s1, s2) => object.ReferenceEquals(s1.Listener, s2.Listener));
-            oldStateStored = object.ReferenceEquals(oldSubscription.Listener, subscription.Listener);
-            return oldSubscription.State;
-        }
-
-        return false;
-    }
-
-    internal object? DisableMeasurements(MeterListener listener)  // called from MeterListener.DisableMeasurementEvents
-        => _subscriptions.Remove(new ListenerSubscription(listener), (s1, s2) => object.ReferenceEquals(s1.Listener, s2.Listener)).State;
-
-    internal virtual void Observe(MeterListener listener) => throw new InvalidOperationException();
-
-    internal object? GetSubscriptionState(MeterListener listener)
-    {
-        DiagNode<ListenerSubscription>? current = _subscriptions.First;
-        while (current is not null)
-        {
-            if (object.ReferenceEquals(listener, current.Value.Listener))
-            {
-                return current.Value.State;
-            }
-            current = current.Next;
-        }
-
-        return null;
-    }
-}
-//------------------------------Ʌ
-
 //------------------------------V
 public class Meter : IDisposable
 {
@@ -1780,13 +1648,296 @@ public readonly struct Measurement<T> where T : struct
 //-------------------------------------------Ʌ
 
 //---------------------------------------------V
+public sealed class InstrumentAdvice<T> where T : struct
+{
+    private readonly ReadOnlyCollection<T>? _HistogramBucketBoundaries;
+
+    public InstrumentAdvice()
+    {
+        Instrument.ValidateTypeParameter<T>();
+    }
+
+    public IReadOnlyList<T>? HistogramBucketBoundaries
+    {
+        get => _HistogramBucketBoundaries;
+        init
+        {
+            List<T> bucketBoundariesCopy = new List<T>(value);
+
+            if (!IsSortedAndDistinct(bucketBoundariesCopy))
+            {
+                throw new ArgumentException(SR.InvalidHistogramExplicitBucketBoundaries, nameof(value));
+            }
+
+            _HistogramBucketBoundaries = new ReadOnlyCollection<T>(bucketBoundariesCopy);
+        }
+    }
+
+    private static bool IsSortedAndDistinct(List<T> values)
+    {
+        Comparer<T> comparer = Comparer<T>.Default;
+
+        for (int i = 1; i < values.Count; i++)
+        {
+            if (comparer.Compare(values[i - 1], values[i]) >= 0)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+}
+//---------------------------------------------Ʌ
+
+//------------------------------V
+public abstract class Instrument
+{
+    internal static KeyValuePair<string, object?>[] EmptyTags => Array.Empty<KeyValuePair<string, object?>>();
+
+    internal static object SyncObject { get; } = new object();
+
+    internal readonly DiagLinkedList<ListenerSubscription> _subscriptions = new DiagLinkedList<ListenerSubscription>();
+
+    protected Instrument(Meter meter, string name) : this(meter, name, unit: null, description: null, tags: null) { }
+    protected Instrument(Meter meter, string name, string? unit, string? description) : this(meter, name, unit, description, tags: null) { }
+
+    protected Instrument(
+        Meter meter,
+        string name,
+        string? unit = default,
+        string? description = default,
+        IEnumerable<KeyValuePair<string, object?>>? tags = default)
+    {
+        Meter = meter ?? throw new ArgumentNullException(nameof(meter));
+        Name = name ?? throw new ArgumentNullException(nameof(name));
+        Description = description;
+        Unit = unit;
+        if (tags is not null)
+        {
+            var tagList = new List<KeyValuePair<string, object?>>(tags);
+            tagList.Sort((left, right) => string.Compare(left.Key, right.Key, StringComparison.Ordinal));
+            Tags = tagList;
+        }
+    }
+
+    protected void Publish()   // <-----------------------mt0.1
+    {
+        // All instruments call Publish when they are created. We don't want to publish the instrument if the Meter is not supported.
+        if (!Meter.IsSupported)
+        {
+            return;
+        }
+
+        List<MeterListener>? allListeners = null;
+        lock (Instrument.SyncObject)
+        {
+            if (Meter.Disposed || !Meter.AddInstrument(this))
+            {
+                return;
+            }
+
+            allListeners = MeterListener.GetAllListeners();
+        }
+
+        if (allListeners is not null)
+        {
+            foreach (MeterListener listener in allListeners)
+            {
+                listener.InstrumentPublished?.Invoke(this, listener);   // <-----------------------mt0.2
+            }
+        }
+    }
+
+    public Meter Meter { get; }
+
+    public string Name { get; }
+
+    public string? Description { get; }
+
+    public string? Unit { get; }
+
+    public IEnumerable<KeyValuePair<string, object?>>? Tags { get; }
+
+    public bool Enabled => _subscriptions.First is not null;
+
+    public virtual bool IsObservable => false;
+
+    internal void NotifyForUnpublishedInstrument()  // NotifyForUnpublishedInstrument is called from Meter.Dispose()
+    {
+        DiagNode<ListenerSubscription>? current = _subscriptions.First;
+        while (current is not null)
+        {
+            current.Value.Listener.DisableMeasurementEvents(this);
+            current = current.Next;
+        }
+
+        _subscriptions.Clear();
+    }
+
+    internal static void ValidateTypeParameter<T>()
+    {
+        Type type = typeof(T);
+        if (type != typeof(byte) && type != typeof(short) && type != typeof(int) && type != typeof(long) &&
+            type != typeof(double) && type != typeof(float) && type != typeof(decimal))
+        {
+            throw new InvalidOperationException(SR.Format(SR.UnsupportedType, type));
+        }
+    }
+
+   
+    internal object? EnableMeasurement(ListenerSubscription subscription, out bool oldStateStored)   // called from MeterListener.EnableMeasurementEvents
+    {
+        oldStateStored = false;
+
+        if (!_subscriptions.AddIfNotExist(subscription, (s1, s2) => object.ReferenceEquals(s1.Listener, s2.Listener)))
+        {
+            ListenerSubscription oldSubscription = _subscriptions.Remove(subscription, (s1, s2) => object.ReferenceEquals(s1.Listener, s2.Listener));
+            _subscriptions.AddIfNotExist(subscription, (s1, s2) => object.ReferenceEquals(s1.Listener, s2.Listener));
+            oldStateStored = object.ReferenceEquals(oldSubscription.Listener, subscription.Listener);
+            return oldSubscription.State;
+        }
+
+        return false;
+    }
+
+    internal object? DisableMeasurements(MeterListener listener)  // called from MeterListener.DisableMeasurementEvents
+        => _subscriptions.Remove(new ListenerSubscription(listener), (s1, s2) => object.ReferenceEquals(s1.Listener, s2.Listener)).State;
+
+    internal virtual void Observe(MeterListener listener) => throw new InvalidOperationException();
+
+    internal object? GetSubscriptionState(MeterListener listener)
+    {
+        DiagNode<ListenerSubscription>? current = _subscriptions.First;
+        while (current is not null)
+        {
+            if (object.ReferenceEquals(listener, current.Value.Listener))
+            {
+                return current.Value.State;
+            }
+            current = current.Next;
+        }
+
+        return null;
+    }
+}
+//------------------------------Ʌ
+
+//-----------------------------------------V
+public abstract partial class Instrument<T> : Instrument where T : struct
+{     
+    public InstrumentAdvice<T>? Advice { get; }
+
+    protected Instrument(Meter meter, string name) : this(meter, name, unit: null, description: null, tags: null, advice: null) { }
+
+    protected Instrument(Meter meter, string name, string? unit, string? description): this(meter, name, unit, description, tags: null, advice: null) { }
+
+    protected Instrument(Meter meter, string name, string? unit, string? description, IEnumerable<KeyValuePair<string, object?>>? tags) : this(meter, name, unit, description, tags, advice: null) { }
+
+    protected Instrument(
+        Meter meter,
+        string name,
+        string? unit = default,
+        string? description = default,
+        IEnumerable<KeyValuePair<string, object?>>? tags = default,
+        InstrumentAdvice<T>? advice = default)
+        : base(meter, name, unit, description, tags)
+    {
+        Advice = advice;
+
+        ValidateTypeParameter<T>();
+    }
+
+    protected void RecordMeasurement(T measurement) => RecordMeasurement(measurement, Instrument.EmptyTags.AsSpan());  // <--------------------------------mt1.1
+
+    protected void RecordMeasurement(T measurement, ReadOnlySpan<KeyValuePair<string, object?>> tags)
+    {
+        DiagNode<ListenerSubscription>? current = _subscriptions.First;
+        while (current is not null)
+        {
+            current.Value.Listener.NotifyMeasurement(this, measurement, tags, current.Value.State);   // <----------------------------------mt1.2.
+            current = current.Next;
+        }
+    }
+}
+//-----------------------------------------Ʌ
+
+//----------------------------V
+public sealed class Counter<T> : Instrument<T> where T : struct
+{
+    internal Counter(Meter meter, string name, string? unit, string? description) : this(meter, name, unit, description, null) { }
+
+    internal Counter(Meter meter, string name, string? unit, string? description, IEnumerable<KeyValuePair<string, object?>>? tags) : base(meter, name, unit, description, tags)
+    {
+        Publish();   // <-----------------------mt0
+    }
+
+    public void Add(T delta) => RecordMeasurement(delta);   // <--------------------------------mt1
+
+    public void Add(T delta, KeyValuePair<string, object?> tag) => RecordMeasurement(delta, tag);
+
+    public void Add(T delta, KeyValuePair<string, object?> tag1, KeyValuePair<string, object?> tag2) => RecordMeasurement(delta, tag1, tag2);
+
+    public void Add(T delta, KeyValuePair<string, object?> tag1, KeyValuePair<string, object?> tag2, KeyValuePair<string, object?> tag3) 
+        => RecordMeasurement(delta, tag1, tag2, tag3);
+
+    public void Add(T delta, params ReadOnlySpan<KeyValuePair<string, object?>> tags) => RecordMeasurement(delta, tags);
+
+    public void Add(T delta, params KeyValuePair<string, object?>[] tags) => RecordMeasurement(delta, tags.AsSpan());
+
+    public void Add(T delta, in TagList tagList) => RecordMeasurement(delta, in tagList);
+}
+//----------------------------Ʌ
+
+public sealed class Histogram<T> : Instrument<T> where T : struct
+{
+    internal Histogram(Meter meter, string name, string? unit, string? description) : this(meter, name, unit, description, tags: null, advice: null) { }
+
+    internal Histogram(Meter meter, string name, string? unit, string? description, IEnumerable<KeyValuePair<string, object?>>? tags, InstrumentAdvice<T>? advice)
+        : base(meter, name, unit, description, tags, advice)
+    {
+        Publish();
+    }
+
+    public void Record(T value) => RecordMeasurement(value);
+
+    public void Record(T value, KeyValuePair<string, object?> tag) => RecordMeasurement(value, tag);
+
+    public void Record(T value, KeyValuePair<string, object?> tag1, KeyValuePair<string, object?> tag2) => RecordMeasurement(value, tag1, tag2);
+
+    public void Record(T value, KeyValuePair<string, object?> tag1, KeyValuePair<string, object?> tag2, KeyValuePair<string, object?> tag3) => RecordMeasurement(value, tag1, tag2, tag3);
+
+    public void Record(T value, params ReadOnlySpan<KeyValuePair<string, object?>> tags) => RecordMeasurement(value, tags);
+
+    public void Record(T value, params KeyValuePair<string, object?>[] tags) => RecordMeasurement(value, tags.AsSpan());
+
+    public void Record(T value, in TagList tagList) => RecordMeasurement(value, in tagList);
+}
+
+
+//----------------------------------------V
+public static class MeterFactoryExtensions
+{
+    public static Meter Create(this IMeterFactory meterFactory, string name, string? version = null, IEnumerable<KeyValuePair<string, object?>>? tags = null)
+    {
+        return meterFactory.Create(new MeterOptions(name)
+        {
+            Version = version,
+            Tags = tags,
+            Scope = meterFactory
+        });
+    }
+}
+//----------------------------------------Ʌ
+
+//---------------------------------------------V
 public sealed class MeterListener : IDisposable
 {
     private static readonly List<MeterListener> s_allStartedListeners = new List<MeterListener>();
     private readonly DiagLinkedList<Instrument> _enabledMeasurementInstruments = new DiagLinkedList<Instrument>();
     private bool _disposed;
 
-    // We initialize all measurement callback with no-op operations so we'll avoid the null checks during the execution;
+    // initialize all measurement callback with no-op operations so we'll avoid the null checks during the execution;
     private MeasurementCallback<byte> _byteMeasurementCallback = (instrument, measurement, tags, state) => { /* no-op */ };
     private MeasurementCallback<short> _shortMeasurementCallback = (instrument, measurement, tags, state) => { /* no-op */ };
     private MeasurementCallback<int> _intMeasurementCallback = (instrument, measurement, tags, state) => { /* no-op */ };
@@ -1794,6 +1945,7 @@ public sealed class MeterListener : IDisposable
     private MeasurementCallback<float> _floatMeasurementCallback = (instrument, measurement, tags, state) => { /* no-op */ };
     private MeasurementCallback<double> _doubleMeasurementCallback = (instrument, measurement, tags, state) => { /* no-op */ };
     private MeasurementCallback<decimal> _decimalMeasurementCallback = (instrument, measurement, tags, state) => { /* no-op */ };
+    // <-----------------------smec set those callbacks
 
     public MeterListener() { }
 
@@ -1989,7 +2141,11 @@ public sealed class MeterListener : IDisposable
     // GetAllListeners is called from Instrument.Publish inside Instrument.SyncObject lock.
     internal static List<MeterListener>? GetAllListeners() => s_allStartedListeners.Count == 0 ? null : new List<MeterListener>(s_allStartedListeners);
 
-    internal void NotifyMeasurement<T>(Instrument instrument, T measurement, ReadOnlySpan<KeyValuePair<string, object?>> tags, object? state) where T : struct
+    internal void NotifyMeasurement<T>(   // <-------------------------mt2.0
+        Instrument instrument, 
+        T measurement, 
+        ReadOnlySpan<KeyValuePair<string, object?>> tags, 
+        object? state) where T : struct
     {
         if (typeof(T) == typeof(byte))
             _byteMeasurementCallback(instrument, (byte)(object)measurement, tags, state);
@@ -2011,4 +2167,127 @@ internal readonly struct ListenerSubscription
     internal object? State { get; }
 }
 //---------------------------------------------Ʌ
+
+//-------------------------------------------V
+public abstract class ObservableInstrument<T> : Instrument where T : struct
+{
+    protected ObservableInstrument(Meter meter, string name, string? unit, string? description) : this(meter, name, unit, description, tags: null) { }
+
+    protected ObservableInstrument(Meter meter, string name, string? unit, string? description, IEnumerable<KeyValuePair<string, object?>>? tags) : base(meter, name, unit, description, tags)
+    {
+        ValidateTypeParameter<T>();
+    }
+
+    protected abstract IEnumerable<Measurement<T>> Observe();
+
+    public override bool IsObservable => true;
+
+    internal override void Observe(MeterListener listener)
+    {
+        object? state = GetSubscriptionState(listener);
+
+        IEnumerable<Measurement<T>> measurements = Observe();
+        if (measurements is null)
+        {
+            return;
+        }
+
+        foreach (Measurement<T> measurement in measurements)
+        {
+            listener.NotifyMeasurement(this, measurement.Value, measurement.Tags, state);
+        }
+    }
+
+    internal static IEnumerable<Measurement<T>> Observe(object callback)
+    {
+        if (callback is Func<T> valueOnlyFunc)
+        {
+            return new Measurement<T>[1] { new Measurement<T>(valueOnlyFunc()) };
+        }
+
+        if (callback is Func<Measurement<T>> measurementOnlyFunc)
+        {
+            return new Measurement<T>[1] { measurementOnlyFunc() };
+        }
+
+        if (callback is Func<IEnumerable<Measurement<T>>> listOfMeasurementsFunc)
+        {
+            return listOfMeasurementsFunc();
+        }
+
+        Debug.Fail("Execution shouldn't reach this point");
+        return null;
+    }
+}
+//-------------------------------------------Ʌ
+
+//--------------------------------------V
+public sealed class ObservableCounter<T> : ObservableInstrument<T> where T : struct
+{
+    private readonly object _callback;
+
+    internal ObservableCounter(Meter meter, string name, Func<T> observeValue, string? unit, string? description) 
+        : this(meter, name, observeValue, unit, description, tags: null) { }
+
+    // ...
+
+    internal ObservableCounter(
+        Meter meter, 
+        string name, 
+        Func<IEnumerable<Measurement<T>>> observeValues, 
+        string? unit, 
+        string? description, 
+        IEnumerable<KeyValuePair<string, object?>>? tags) : base(meter, name, unit, description, tags)
+    {
+        _callback = observeValues ?? throw new ArgumentNullException(nameof(observeValues));
+        Publish();
+    }
+
+    protected override IEnumerable<Measurement<T>> Observe() => Observe(_callback);
+}
+//--------------------------------------Ʌ
+
+//----------------------------V
+public interface IMeterFactory : IDisposable
+{      
+    Meter Create(MeterOptions options);
+}
+//----------------------------Ʌ
+
+//-------------------------------------V
+internal sealed class DummyMeterFactory : IMeterFactory
+{
+    public Meter Create(MeterOptions options) => new Meter(options);
+ 
+    public void Dispose() { }
+}
+//-------------------------------------Ʌ
+
+//-----------------------V
+public class MeterOptions
+{
+    private string _name;
+
+    public string Name
+    {
+        get => _name;
+        set => _name = value ?? throw new ArgumentNullException(nameof(value));
+    }
+
+    public string? Version { get; set; }
+
+    public IEnumerable<KeyValuePair<string, object?>>? Tags { get; set; }
+
+    public object? Scope { get; set; }
+
+    public string? TelemetrySchemaUrl { get; set; }
+
+    public MeterOptions(string name)
+    {
+        Name = name;
+    }
+}
+//-----------------------Ʌ
+
+
 ```

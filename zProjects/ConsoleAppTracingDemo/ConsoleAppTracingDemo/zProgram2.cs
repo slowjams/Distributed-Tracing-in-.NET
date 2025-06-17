@@ -12,9 +12,9 @@ public class Worker
     }
 }
 
-internal class Program
+internal class Programzz
 {
-    static void Main(string[] args)
+    static void Mainzz(string[] args)
     {
         using var listener = new ActivityListener
         {
