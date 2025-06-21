@@ -1381,7 +1381,7 @@ public class Meter : IDisposable
 
     public Meter(MeterOptions options)
     {
-        Initialize(options.Name, options.Version, options.Tags, options.Scope, options.TelemetrySchemaUrl);
+        Initialize(options.Name, options.Version, options.Tags, options.Scope, options.TelemetrySchemaUrl);   // <--------------------------met1.0
     }
 
     public Meter(string name) : this(name, null, null, null) { }
@@ -1391,7 +1391,6 @@ public class Meter : IDisposable
     public Meter(string name, string? version, IEnumerable<KeyValuePair<string, object?>>? tags, object? scope = null)
     {
         Initialize(name, version, tags, scope, telemetrySchemaUrl: null);
-        Debug.Assert(Name is not null);
     }
 
     private void Initialize(string name, string? version, IEnumerable<KeyValuePair<string, object?>>? tags, object? scope = null, string? telemetrySchemaUrl = null)
@@ -1414,10 +1413,9 @@ public class Meter : IDisposable
 
         lock (Instrument.SyncObject)
         {
-            s_allMeters.Add(this);
+            s_allMeters.Add(this);  // <-----------------------------met1.1.
         }
 
-        // Ensure the metrics EventSource has been created in case we need to log this meter
         GC.KeepAlive(MetricsEventSource.Log);
     }
 
@@ -1432,30 +1430,21 @@ public class Meter : IDisposable
     public string? TelemetrySchemaUrl { get; private set; }
 
     public Counter<T> CreateCounter<T>(string name, string? unit, string? description, IEnumerable<KeyValuePair<string, object?>>? tags) where T : struct
-            => (Counter<T>)GetOrCreateInstrument<T>(typeof(Counter<T>), name, unit, description, tags, () => new Counter<T>(this, name, unit, description, tags));
+        => (Counter<T>)GetOrCreateInstrument<T>(typeof(Counter<T>), name, unit, description, tags, () => new Counter<T>(this, name, unit, description, tags));
 
     public Gauge<T> CreateGauge<T>(string name, string? unit = null, string? description = null, IEnumerable<KeyValuePair<string, object?>>? tags = null) where T : struct
-            => (Gauge<T>)GetOrCreateInstrument<T>(typeof(Gauge<T>), name, unit, description, tags, () => new Gauge<T>(this, name, unit, description, tags));
+        => (Gauge<T>)GetOrCreateInstrument<T>(typeof(Gauge<T>), name, unit, description, tags, () => new Gauge<T>(this, name, unit, description, tags));
 
     public Histogram<T> CreateHistogram<T>(string name, string? unit = default, string? description = default, IEnumerable<KeyValuePair<string, object?>>? tags = default, InstrumentAdvice<T>? advice = default) where T : struct
-            => (Histogram<T>)GetOrCreateInstrument<T>(typeof(Histogram<T>), name, unit, description, tags, () => new Histogram<T>(this, name, unit, description, tags, advice));
+        => (Histogram<T>)GetOrCreateInstrument<T>(typeof(Histogram<T>), name, unit, description, tags, () => new Histogram<T>(this, name, unit, description, tags, advice));
 
     public UpDownCounter<T> CreateUpDownCounter<T>(string name, string? unit, string? description, IEnumerable<KeyValuePair<string, object?>>? tags) where T : struct
-            => (UpDownCounter<T>)GetOrCreateInstrument<T>(typeof(UpDownCounter<T>), name, unit, description, tags, () => new UpDownCounter<T>(this, name, unit, description, tags));
+        => (UpDownCounter<T>)GetOrCreateInstrument<T>(typeof(UpDownCounter<T>), name, unit, description, tags, () => new UpDownCounter<T>(this, name, unit, description, tags));
 
     public ObservableUpDownCounter<T> CreateObservableUpDownCounter<T>(string name, Func<IEnumerable<Measurement<T>>> observeValues, string? unit, string? description, IEnumerable<KeyValuePair<string, object?>>? tags) where T : struct
         =>  new ObservableUpDownCounter<T>(this, name, observeValues, unit, description, tags);
 
-    public ObservableCounter<T> CreateObservableCounter<T>(string name, Func<T> observeValue, string? unit = null, string? description = null) where T : struct
-        => new ObservableCounter<T>(this, name, observeValue, unit, description, tags: null);
-
-    public ObservableCounter<T> CreateObservableCounter<T>(string name, Func<T> observeValue, string? unit, string? description, IEnumerable<KeyValuePair<string, object?>>? tags) where T : struct => new ObservableCounter<T>(this, name, observeValue, unit, description, tags);
-
-    public ObservableCounter<T> CreateObservableCounter<T>(string name, Func<IEnumerable<Measurement<T>>> observeValues, string? unit, string? description, IEnumerable<KeyValuePair<string, object?>>? tags) where T : struct 
-        => new ObservableCounter<T>(this, name, observeValues, unit, description, tags);
-
-    public ObservableGauge<T> CreateObservableGauge<T>(string name, Func<IEnumerable<Measurement<T>>> observeValues, string? unit, string? description, IEnumerable<KeyValuePair<string, object?>>? tags) where T : struct 
-        => new ObservableGauge<T>(this, name, observeValues, unit, description, tags);
+    // ...
 
     public void Dispose() => Dispose(true);
 
@@ -1497,7 +1486,6 @@ public class Meter : IDisposable
 
     private static Instrument? GetCachedInstrument(List<Instrument> instrumentList, Type instrumentType, string? unit, string? description, IEnumerable<KeyValuePair<string, object?>>? tags)
     {
-        Debug.Assert(instrumentList is not null);
         foreach (Instrument instrument in instrumentList)
         {
             if (instrument.GetType() == instrumentType && instrument.Unit == unit &&
@@ -1564,8 +1552,7 @@ public class Meter : IDisposable
         return false;
     }
 
-    // Called from MeterListener.Start
-    // This method is called inside the lock Instrument.SyncObject
+    // called from MeterListener.Start, this method is called inside the lock Instrument.SyncObject
     internal static List<Instrument>? GetPublishedInstruments()
     {
         List<Instrument>? instruments = null;
@@ -1702,12 +1689,7 @@ public abstract class Instrument
     protected Instrument(Meter meter, string name) : this(meter, name, unit: null, description: null, tags: null) { }
     protected Instrument(Meter meter, string name, string? unit, string? description) : this(meter, name, unit, description, tags: null) { }
 
-    protected Instrument(
-        Meter meter,
-        string name,
-        string? unit = default,
-        string? description = default,
-        IEnumerable<KeyValuePair<string, object?>>? tags = default)
+    protected Instrument(Meter meter, string name, string? unit = default, string? description = default, IEnumerable<KeyValuePair<string, object?>>? tags = default)
     {
         Meter = meter ?? throw new ArgumentNullException(nameof(meter));
         Name = name ?? throw new ArgumentNullException(nameof(name));
@@ -1721,7 +1703,7 @@ public abstract class Instrument
         }
     }
 
-    protected void Publish()   // <-----------------------mt0.1
+    protected void Publish()   // <-----------------------met2.1
     {
         // All instruments call Publish when they are created. We don't want to publish the instrument if the Meter is not supported.
         if (!Meter.IsSupported)
@@ -1732,24 +1714,24 @@ public abstract class Instrument
         List<MeterListener>? allListeners = null;
         lock (Instrument.SyncObject)
         {
-            if (Meter.Disposed || !Meter.AddInstrument(this))
+            if (Meter.Disposed || !Meter.AddInstrument(this))   // <-----------------met2.2, add this Instrument to Meter's internal list of instruments
             {
                 return;
             }
 
-            allListeners = MeterListener.GetAllListeners();
+            allListeners = MeterListener.GetAllListeners();   // <-----------------------
         }
 
         if (allListeners is not null)
         {
             foreach (MeterListener listener in allListeners)
             {
-                listener.InstrumentPublished?.Invoke(this, listener);   // <-----------------------mt0.2
+                listener.InstrumentPublished?.Invoke(this, listener);   // <-----------------------met2.3
             }
         }
     }
 
-    public Meter Meter { get; }
+    public Meter Meter { get; }   // <-----------------------------
 
     public string Name { get; }
 
@@ -1786,7 +1768,7 @@ public abstract class Instrument
     }
 
    
-    internal object? EnableMeasurement(ListenerSubscription subscription, out bool oldStateStored)   // called from MeterListener.EnableMeasurementEvents
+    internal object? EnableMeasurement(ListenerSubscription subscription, out bool oldStateStored)  
     {
         oldStateStored = false;
 
@@ -1848,14 +1830,14 @@ public abstract partial class Instrument<T> : Instrument where T : struct
         ValidateTypeParameter<T>();
     }
 
-    protected void RecordMeasurement(T measurement) => RecordMeasurement(measurement, Instrument.EmptyTags.AsSpan());  // <--------------------------------mt1.1
+    protected void RecordMeasurement(T measurement) => RecordMeasurement(measurement, Instrument.EmptyTags.AsSpan());  // <--------------------------------met3.1
 
     protected void RecordMeasurement(T measurement, ReadOnlySpan<KeyValuePair<string, object?>> tags)
     {
         DiagNode<ListenerSubscription>? current = _subscriptions.First;
         while (current is not null)
         {
-            current.Value.Listener.NotifyMeasurement(this, measurement, tags, current.Value.State);   // <----------------------------------mt1.2.
+            current.Value.Listener.NotifyMeasurement(this, measurement, tags, current.Value.State);   // <----------------------------------met3.2
             current = current.Next;
         }
     }
@@ -1868,11 +1850,12 @@ public sealed class Counter<T> : Instrument<T> where T : struct
     internal Counter(Meter meter, string name, string? unit, string? description) : this(meter, name, unit, description, null) { }
 
     internal Counter(Meter meter, string name, string? unit, string? description, IEnumerable<KeyValuePair<string, object?>>? tags) : base(meter, name, unit, description, tags)
-    {
-        Publish();   // <-----------------------mt0
+    {        
+                     // meter is passed to Instrument's constructor
+        Publish();   // <-----------------------met2.0, call Instrument's Publish, not Instrument<T>'s
     }
 
-    public void Add(T delta) => RecordMeasurement(delta);   // <--------------------------------mt1
+    public void Add(T delta) => RecordMeasurement(delta);   // <--------------------------------met3.0
 
     public void Add(T delta, KeyValuePair<string, object?> tag) => RecordMeasurement(delta, tag);
 
@@ -1947,13 +1930,16 @@ public sealed class MeterListener : IDisposable
     private MeasurementCallback<decimal> _decimalMeasurementCallback = (instrument, measurement, tags, state) => { /* no-op */ };
     // <-----------------------smec set those callbacks
 
-    public MeterListener() { }
+    public MeterListener() 
+    { 
+        RuntimeMetrics.EnsureInitialized(); 
+    }
 
     public Action<Instrument, MeterListener>? InstrumentPublished { get; set; }
 
     public Action<Instrument, object?>? MeasurementsCompleted { get; set; }
 
-    public void EnableMeasurementEvents(Instrument instrument, object? state = null)
+    public void EnableMeasurementEvents(Instrument instrument, object? state = null)   // <----------------------------met2.5.0
     {
         if (!Meter.IsSupported)
         {
@@ -2044,7 +2030,7 @@ public sealed class MeterListener : IDisposable
 
             if (!s_allStartedListeners.Contains(this))
             {
-                s_allStartedListeners.Add(this);
+                s_allStartedListeners.Add(this);  // <------------------------------
                 publishedInstruments = Meter.GetPublishedInstruments();
             }
         }
@@ -2141,7 +2127,7 @@ public sealed class MeterListener : IDisposable
     // GetAllListeners is called from Instrument.Publish inside Instrument.SyncObject lock.
     internal static List<MeterListener>? GetAllListeners() => s_allStartedListeners.Count == 0 ? null : new List<MeterListener>(s_allStartedListeners);
 
-    internal void NotifyMeasurement<T>(   // <-------------------------mt2.0
+    internal void NotifyMeasurement<T>(   // <-------------------------met3.3
         Instrument instrument, 
         T measurement, 
         ReadOnlySpan<KeyValuePair<string, object?>> tags, 
@@ -2150,7 +2136,7 @@ public sealed class MeterListener : IDisposable
         if (typeof(T) == typeof(byte))
             _byteMeasurementCallback(instrument, (byte)(object)measurement, tags, state);
         if (typeof(T) == typeof(int))
-            _intMeasurementCallback(instrument, (int)(object)measurement, tags, state);
+            _intMeasurementCallback(instrument, (int)(object)measurement, tags, state);   // <-------------------------met3.4
         // ...
     }
 }
@@ -2247,6 +2233,20 @@ public sealed class ObservableCounter<T> : ObservableInstrument<T> where T : str
 }
 //--------------------------------------Ʌ
 
+public static class MeterFactoryExtensions
+{
+    public static Meter Create(this IMeterFactory meterFactory, string name, string? version = null, IEnumerable<KeyValuePair<string, object?>>? tags = null)
+    {
+
+        return meterFactory.Create(new MeterOptions(name)
+        {
+            Version = version,
+            Tags = tags,
+            Scope = meterFactory
+        });
+    }
+}
+
 //----------------------------V
 public interface IMeterFactory : IDisposable
 {      
@@ -2257,7 +2257,7 @@ public interface IMeterFactory : IDisposable
 //-------------------------------------V
 internal sealed class DummyMeterFactory : IMeterFactory
 {
-    public Meter Create(MeterOptions options) => new Meter(options);
+    public Meter Create(MeterOptions options) => new Meter(options);  // <--------------------------met0
  
     public void Dispose() { }
 }
@@ -2288,6 +2288,4 @@ public class MeterOptions
     }
 }
 //-----------------------Ʌ
-
-
 ```

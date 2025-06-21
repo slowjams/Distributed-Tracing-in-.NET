@@ -31,9 +31,8 @@ namespace BookStore.Infrastructure.Metrics
 
         public BookStoreMetrics(IMeterFactory meterFactory, IConfiguration configuration)
         {
-            var meter = meterFactory.Create(configuration["BookStoreMeterName"] ?? 
-                                            throw new NullReferenceException("BookStore meter missing a name"));
-
+            Meter meter = meterFactory.Create(configuration["BookStoreMeterName"] ?? throw new NullReferenceException("BookStore meter missing a name"));
+                                              // <----------"BookStore"
             BooksAddedCounter = meter.CreateCounter<int>("books-added", "Book");
             BooksDeletedCounter = meter.CreateCounter<int>("books-deleted", "Book");
             BooksUpdatedCounter = meter.CreateCounter<int>("books-updated", "Book");

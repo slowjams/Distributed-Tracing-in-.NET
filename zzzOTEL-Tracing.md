@@ -1,4 +1,4 @@
-## OpenTelemetry
+## OpenTelemetry Tracing
 
 ```C#
 public class Program
@@ -2310,7 +2310,7 @@ internal sealed class TracerProviderSdk : TracerProvider
     internal int ShutdownCount;
     internal bool Disposed;
 
-    private readonly List<object> instrumentations = [];
+    private readonly List<object> instrumentations = [];  // <---------------------this contains AspNetCoreInstrumentation and HttpClientInstrumentation
     private readonly ActivityListener listener; // <-------------------
     private readonly Sampler sampler; // <-----------------------------
     private readonly Action<Activity> getRequestedDataAction;
@@ -2370,11 +2370,11 @@ internal sealed class TracerProviderSdk : TracerProvider
             processorsAdded.Append(';');
         }
 
-        foreach (var instrumentation in state.Instrumentation)
+        foreach (var instrumentation in state.Instrumentation)  // <-------------------state.Instrumentation is InstrumentationRegistration
         {
             if (instrumentation.Instance is not null)
             {
-                this.instrumentations.Add(instrumentation.Instance);
+                this.instrumentations.Add(instrumentation.Instance);  // instance is AspNetCoreInstrumentation and HttpClientInstrumentation
             }
 
             instrumentationFactoriesAdded.Append(instrumentation.Name);

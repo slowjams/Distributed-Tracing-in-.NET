@@ -1,6 +1,139 @@
 ## OpenTelemetry Metrics
 
 ```C#
+//-----------------------------------------------V
+var builder = WebApplication.CreateBuilder(args);
+// ...
+builder.Services.AddOpenTelemetry().WithMetrics(opts => opts
+    .SetResourceBuilder(ResourceBuilder.CreateDefault().AddService("BookStore.WebApi"))
+    .AddMeter(builder.Configuration.GetValue<string>("BookStoreMeterName"))
+    .AddAspNetCoreInstrumentation()
+    .AddProcessInstrumentation()
+    .AddRuntimeInstrumentation()
+    .AddView(
+        instrumentName: "orders-price",
+        new ExplicitBucketHistogramConfiguration { Boundaries = [15, 30, 45, 60, 75] })
+    .AddView(
+        instrumentName: "orders-number-of-books",
+        new ExplicitBucketHistogramConfiguration { Boundaries = [1, 2, 5] })
+    .AddConsoleExporter()
+    .AddOtlpExporter(options  =>
+    {
+        options.Endpoint = new Uri(builder.Configuration["Otlp:Endpoint"] ?? throw new InvalidOperationException());
+    }));
+
+var app = builder.Build();
+//-----------------------------------------------Ʌ
+```
+
+```C#
+//---------------------------V
+public class BookStoreMetrics
+{
+    //Books meters
+    private  Counter<int> BooksAddedCounter { get; }
+    private  Counter<int> BooksDeletedCounter { get; }
+    private  Counter<int> BooksUpdatedCounter { get; }
+    private  UpDownCounter<int> TotalBooksUpDownCounter { get; }
+
+    //Categories meters
+    private Counter<int> CategoriesAddedCounter { get; }
+    private Counter<int> CategoriesDeletedCounter { get; }
+    private Counter<int> CategoriesUpdatedCounter { get; }
+    private ObservableGauge<int> TotalCategoriesGauge { get; }
+    private int _totalCategories = 0;
+
+    //Order meters
+    private Histogram<double> OrdersPriceHistogram { get; }
+    private Histogram<int> NumberOfBooksPerOrderHistogram { get; }
+    private ObservableCounter<int> OrdersCanceledCounter { get; }
+    private int _ordersCanceled = 0;
+    private Counter<int> TotalOrdersCounter { get; }
+
+    public BookStoreMetrics(IMeterFactory meterFactory, IConfiguration configuration)
+    {
+        var meter = meterFactory.Create(configuration["BookStoreMeterName"] ?? throw new NullReferenceException("BookStore meter missing a name"));
+
+        BooksAddedCounter = meter.CreateCounter<int>("books-added", "Book");
+        BooksDeletedCounter = meter.CreateCounter<int>("books-deleted", "Book");
+        BooksUpdatedCounter = meter.CreateCounter<int>("books-updated", "Book");
+        TotalBooksUpDownCounter = meter.CreateUpDownCounter<int>("total-books", "Book");
+        
+        CategoriesAddedCounter = meter.CreateCounter<int>("categories-added", "Category");
+        CategoriesDeletedCounter = meter.CreateCounter<int>("categories-deleted", "Category");
+        CategoriesUpdatedCounter = meter.CreateCounter<int>("categories-updated", "Category");
+        TotalCategoriesGauge = meter.CreateObservableGauge<int>("total-categories", () => _totalCategories);
+
+        OrdersPriceHistogram = meter.CreateHistogram<double>("orders-price", "Euros", "Price distribution of book orders");
+        NumberOfBooksPerOrderHistogram = meter.CreateHistogram<int>("orders-number-of-books", "Books", "Number of books per order");
+        OrdersCanceledCounter = meter.CreateObservableCounter<int>("orders-canceled", () => _ordersCanceled);
+        TotalOrdersCounter = meter.CreateCounter<int>("total-orders", "Orders");
+    }
+
+
+    //Books meters
+    public void AddBook() => BooksAddedCounter.Add(1);
+    public void DeleteBook() => BooksDeletedCounter.Add(1);
+    public void UpdateBook() => BooksUpdatedCounter.Add(1);
+    public void IncreaseTotalBooks() => TotalBooksUpDownCounter.Add(1);
+    public void DecreaseTotalBooks() => TotalBooksUpDownCounter.Add(-1);
+
+    //Categories meters
+    public void AddCategory() => CategoriesAddedCounter.Add(1);
+    public void DeleteCategory() => CategoriesDeletedCounter.Add(1);
+    public void UpdateCategory() => CategoriesUpdatedCounter.Add(1);
+    public void IncreaseTotalCategories() => _totalCategories++;
+    public void DecreaseTotalCategories() => _totalCategories--;
+
+    //Orders meters
+    public void RecordOrderTotalPrice(double price) => OrdersPriceHistogram.Record(price);
+    public void RecordNumberOfBooks(int amount) => NumberOfBooksPerOrderHistogram.Record(amount);
+    public void IncreaseOrdersCanceled() => _ordersCanceled++;
+    public void IncreaseTotalOrders(string city) => TotalOrdersCounter.Add(1, KeyValuePair.Create<string, object>("City", city));
+}
+//---------------------------Ʌ
+
+//-------------------------------------------------------------------------------V
+public class OrderRepository(BookStoreDbContext context, BookStoreMetrics meters) : Repository<Order>(context), IOrderRepository
+{
+    public override async Task<Order> GetById(int id)
+    {
+        return await Db.Orders
+            .Include(b => b.Books)
+            .FirstOrDefaultAsync(x => x.Id == id);
+    }
+
+    public override async Task<List<Order>> GetAll()
+    {
+        return await Db.Orders
+            .Include(b => b.Books)
+            .ToListAsync();
+    }
+
+    public override async Task Add(Order entity)
+    {
+        DbSet.Add(entity);
+        await base.SaveChanges();
+
+        meters.RecordOrderTotalPrice(entity.TotalAmount);
+        meters.RecordNumberOfBooks(entity.Books.Count);
+        meters.IncreaseTotalOrders(entity.City);
+    }
+
+    public override async Task Update(Order entity)
+    {
+        await base.Update(entity);
+
+        meters.IncreaseOrdersCanceled();
+    }
+}
+//-------------------------------------------------------------------------------Ʌ
+```
+
+
+========================================================================
+
+```C#
 //--------------------------------------V
 public sealed class OpenTelemetryBuilder : IOpenTelemetryBuilder
 {
@@ -26,8 +159,7 @@ public sealed class OpenTelemetryBuilder : IOpenTelemetryBuilder
     {
         OpenTelemetryBuilderSdkExtensions.WithMetrics(this, configure);
         return this;
-    }
-    
+    }   
     // ...
 }
 //--------------------------------------Ʌ
@@ -60,7 +192,6 @@ public static class OpenTelemetryBuilderSdkExtensions
 
         return builder;
     }
-
     // ...
 }
 //---------------------------------------------------Ʌ
@@ -89,6 +220,353 @@ internal static class OpenTelemetryMetricsBuilderExtensions
     }
 }
 //---------------------------------------------------------Ʌ
+
+//------------------------------------------------V
+public static class MeterProviderBuilderExtensions
+{
+    public static MeterProviderBuilder AddReader(this MeterProviderBuilder meterProviderBuilder, MetricReader reader)
+    {
+        meterProviderBuilder.ConfigureBuilder((sp, builder) =>
+        {
+            if (builder is MeterProviderBuilderSdk meterProviderBuilderSdk)
+                meterProviderBuilderSdk.AddReader(reader);
+        });
+
+        return meterProviderBuilder;
+    }
+
+    public static MeterProviderBuilder AddReader<T>(this MeterProviderBuilder meterProviderBuilder) where T : MetricReader
+    {
+        meterProviderBuilder.ConfigureServices(services => services.TryAddSingleton<T>());
+
+        meterProviderBuilder.ConfigureBuilder((sp, builder) =>
+        {
+            if (builder is MeterProviderBuilderSdk meterProviderBuilderSdk)
+                meterProviderBuilderSdk.AddReader(sp.GetRequiredService<T>());
+        });
+
+        return meterProviderBuilder;
+    }
+
+    public static MeterProviderBuilder AddReader(this MeterProviderBuilder meterProviderBuilder, Func<IServiceProvider, MetricReader> implementationFactory)
+    {
+        meterProviderBuilder.ConfigureBuilder((sp, builder) =>
+        {
+            if (builder is MeterProviderBuilderSdk meterProviderBuilderSdk)
+                meterProviderBuilderSdk.AddReader(implementationFactory(sp));
+        });
+
+        return meterProviderBuilder;
+    }
+
+    public static MeterProviderBuilder AddView(this MeterProviderBuilder meterProviderBuilder, string instrumentName, string name)
+    {
+        if (!MeterProviderBuilderSdk.IsValidInstrumentName(name))
+            throw new ArgumentException($"Custom view name {name} is invalid.", nameof(name));
+
+        if (instrumentName.Contains('*', StringComparison.Ordinal))
+        {
+            throw new ArgumentException($"Instrument selection criteria is invalid. Instrument name '{instrumentName}' " +
+                $"contains a wildcard character. This is not allowed when using a view to " + $"rename a metric stream as it would lead to conflicting metric stream names.",
+                nameof(instrumentName));
+        }
+
+        meterProviderBuilder.AddView(instrumentName, new MetricStreamConfiguration { Name = name });
+
+        return meterProviderBuilder;
+    }
+
+    public static MeterProviderBuilder AddView(this MeterProviderBuilder meterProviderBuilder, string instrumentName, MetricStreamConfiguration metricStreamConfiguration)
+    {
+        if (metricStreamConfiguration.Name != null && instrumentName.Contains('*', StringComparison.Ordinal))
+        {
+            throw new ArgumentException($"Instrument selection criteria is invalid. Instrument name '{instrumentName}' " +
+                $"contains a wildcard character. This is not allowed when using a view to " +  $"rename a metric stream as it would lead to conflicting metric stream names.",
+                nameof(instrumentName));
+        }
+
+        meterProviderBuilder.ConfigureBuilder((sp, builder) =>
+        {
+            if (builder is MeterProviderBuilderSdk meterProviderBuilderSdk)
+            {
+                if (instrumentName.Contains('*', StringComparison.Ordinal))
+                {
+                    var pattern = '^' + Regex.Escape(instrumentName).Replace("\\*", ".*", StringComparison.Ordinal);
+
+                    var regex = new Regex(pattern, RegexOptions.Compiled | RegexOptions.IgnoreCase);
+                    meterProviderBuilderSdk.AddView(instrument => regex.IsMatch(instrument.Name) ? metricStreamConfiguration : null);
+                }
+                else
+                {
+                    meterProviderBuilderSdk.AddView(instrument => instrument.Name.Equals(instrumentName, StringComparison.OrdinalIgnoreCase) ? metricStreamConfiguration : null);
+                }
+            }
+        });
+
+        return meterProviderBuilder;
+    }
+
+    public static MeterProviderBuilder AddView(this MeterProviderBuilder meterProviderBuilder, Func<Instrument, MetricStreamConfiguration?> viewConfig)
+    {
+        meterProviderBuilder.ConfigureBuilder((sp, builder) =>
+        {
+            if (builder is MeterProviderBuilderSdk meterProviderBuilderSdk)
+                meterProviderBuilderSdk.AddView(viewConfig);
+        });
+
+        return meterProviderBuilder;
+    }
+
+    public static MeterProviderBuilder SetMaxMetricStreams(this MeterProviderBuilder meterProviderBuilder, int maxMetricStreams)
+    {
+        meterProviderBuilder.ConfigureBuilder((sp, builder) =>
+        {
+            if (builder is MeterProviderBuilderSdk meterProviderBuilderSdk)
+            {
+                meterProviderBuilderSdk.SetMetricLimit(maxMetricStreams);
+            }
+        });
+
+        return meterProviderBuilder;
+    }
+
+    public static MeterProviderBuilder SetMaxMetricPointsPerMetricStream(this MeterProviderBuilder meterProviderBuilder, int maxMetricPointsPerMetricStream)
+    {
+        meterProviderBuilder.ConfigureBuilder((sp, builder) =>
+        {
+            if (builder is MeterProviderBuilderSdk meterProviderBuilderSdk)
+                meterProviderBuilderSdk.SetDefaultCardinalityLimit(maxMetricPointsPerMetricStream);
+        });
+
+        return meterProviderBuilder;
+    }
+
+    public static MeterProviderBuilder SetResourceBuilder(this MeterProviderBuilder meterProviderBuilder, ResourceBuilder resourceBuilder)
+    {
+        meterProviderBuilder.ConfigureBuilder((sp, builder) =>
+        {
+            if (builder is MeterProviderBuilderSdk meterProviderBuilderSdk)
+                meterProviderBuilderSdk.SetResourceBuilder(resourceBuilder);
+        });
+
+        return meterProviderBuilder;
+    }
+
+    public static MeterProviderBuilder ConfigureResource(this MeterProviderBuilder meterProviderBuilder, Action<ResourceBuilder> configure)
+    {
+        meterProviderBuilder.ConfigureBuilder((sp, builder) =>
+        {
+            if (builder is MeterProviderBuilderSdk meterProviderBuilderSdk)
+                meterProviderBuilderSdk.ConfigureResource(configure);
+        });
+
+        return meterProviderBuilder;
+    }
+
+    public static MeterProvider Build(this MeterProviderBuilder meterProviderBuilder)
+    {
+        if (meterProviderBuilder is MeterProviderBuilderBase meterProviderBuilderBase)
+            return meterProviderBuilderBase.InvokeBuild();
+
+        throw new NotSupportedException($"Build is not supported on '{meterProviderBuilder?.GetType().FullName ?? "null"}' instances.");
+    }
+
+    public static MeterProviderBuilder SetExemplarFilter(this MeterProviderBuilder meterProviderBuilder, ExemplarFilterType exemplarFilter)
+    {
+        meterProviderBuilder.ConfigureBuilder((sp, builder) =>
+        {
+            if (builder is MeterProviderBuilderSdk meterProviderBuilderSdk)
+            {
+                switch (exemplarFilter)
+                {
+                    case ExemplarFilterType.AlwaysOn:
+                    case ExemplarFilterType.AlwaysOff:
+                    case ExemplarFilterType.TraceBased:
+                        meterProviderBuilderSdk.SetExemplarFilter(exemplarFilter);
+                        break;
+                    default:
+                        throw new NotSupportedException($"ExemplarFilterType '{exemplarFilter}' is not supported.");
+                }
+            }
+        });
+
+        return meterProviderBuilder;
+    }
+}
+//------------------------------------------------Ʌ
+
+//----------------------------------------------V
+public static class OtlpMetricExporterExtensions
+{
+    public static MeterProviderBuilder AddOtlpExporter(this MeterProviderBuilder builder)
+        => AddOtlpExporter(builder, name: null, configure: null);
+
+    public static MeterProviderBuilder AddOtlpExporter(this MeterProviderBuilder builder, Action<OtlpExporterOptions> configure)
+        => AddOtlpExporter(builder, name: null, configure);
+
+    public static MeterProviderBuilder AddOtlpExporter(this MeterProviderBuilder builder, string? name, Action<OtlpExporterOptions>? configure)
+    {
+        var finalOptionsName = name ?? Options.DefaultName;
+
+        builder.ConfigureServices(services =>
+        {
+            if (name != null && configure != null)
+            {
+                // if we are using named options we register the configuration delegate into options pipeline.
+                services.Configure(finalOptionsName, configure);
+            }
+
+            services.AddOtlpExporterMetricsServices(finalOptionsName);
+        });
+
+        return builder.AddReader(sp =>
+        {
+            OtlpExporterOptions exporterOptions;
+
+            if (name == null)
+            {
+                exporterOptions = sp.GetRequiredService<IOptionsFactory<OtlpExporterOptions>>().Create(finalOptionsName);
+
+                configure?.Invoke(exporterOptions);
+            }
+            else
+            {
+                exporterOptions = sp.GetRequiredService<IOptionsMonitor<OtlpExporterOptions>>().Get(finalOptionsName);
+            }
+
+            return BuildOtlpExporterMetricReader(
+                sp,
+                exporterOptions,
+                sp.GetRequiredService<IOptionsMonitor<MetricReaderOptions>>().Get(finalOptionsName),
+                sp.GetRequiredService<IOptionsMonitor<ExperimentalOptions>>().Get(finalOptionsName));
+        });
+    }
+
+    public static MeterProviderBuilder AddOtlpExporter(this MeterProviderBuilder builder, Action<OtlpExporterOptions, MetricReaderOptions> configureExporterAndMetricReader)
+        => AddOtlpExporter(builder, name: null, configureExporterAndMetricReader);
+
+    public static MeterProviderBuilder AddOtlpExporter(this MeterProviderBuilder builder, string? name,
+        Action<OtlpExporterOptions, MetricReaderOptions>? configureExporterAndMetricReader)
+    {
+        var finalOptionsName = name ?? Options.DefaultName;
+
+        builder.ConfigureServices(services =>
+        {
+            services.AddOtlpExporterMetricsServices(finalOptionsName);
+        });
+
+        return builder.AddReader(sp =>
+        {
+            OtlpExporterOptions exporterOptions;
+            if (name == null)
+                exporterOptions = sp.GetRequiredService<IOptionsFactory<OtlpExporterOptions>>().Create(finalOptionsName);
+            else
+                exporterOptions = sp.GetRequiredService<IOptionsMonitor<OtlpExporterOptions>>().Get(finalOptionsName);
+
+            var metricReaderOptions = sp.GetRequiredService<IOptionsMonitor<MetricReaderOptions>>().Get(finalOptionsName);
+
+            configureExporterAndMetricReader?.Invoke(exporterOptions, metricReaderOptions);
+
+            return BuildOtlpExporterMetricReader(
+                sp,
+                exporterOptions,
+                metricReaderOptions,
+                sp.GetRequiredService<IOptionsMonitor<ExperimentalOptions>>().Get(finalOptionsName));
+        });
+    }
+
+    internal static MetricReader BuildOtlpExporterMetricReader(
+        IServiceProvider serviceProvider,
+        OtlpExporterOptions exporterOptions,
+        MetricReaderOptions metricReaderOptions,
+        ExperimentalOptions experimentalOptions,
+        bool skipUseOtlpExporterRegistrationCheck = false,
+        Func<BaseExporter<Metric>, BaseExporter<Metric>>? configureExporterInstance = null)
+    {
+        if (exporterOptions!.Protocol == OtlpExportProtocol.Grpc && ReferenceEquals(exporterOptions.HttpClientFactory, exporterOptions.DefaultHttpClientFactory))
+        {
+            throw new NotSupportedException("OtlpExportProtocol.Grpc with the default HTTP client factory is not supported on .NET Framework or .NET Standard 2.0." +
+                "Please switch to OtlpExportProtocol.HttpProtobuf or provide a custom HttpClientFactory.");
+        }
+
+        if (!skipUseOtlpExporterRegistrationCheck)
+            serviceProvider!.EnsureNoUseOtlpExporterRegistrations();
+
+        exporterOptions!.TryEnableIHttpClientFactoryIntegration(serviceProvider!, "OtlpMetricExporter");
+
+        BaseExporter<Metric> metricExporter = new OtlpMetricExporter(exporterOptions!, experimentalOptions!);
+
+        if (configureExporterInstance != null)
+        {
+            metricExporter = configureExporterInstance(metricExporter);
+        }
+
+        return PeriodicExportingMetricReaderHelper.CreatePeriodicExportingMetricReader(metricExporter, metricReaderOptions!);   // use PeriodicExportingMetricReader
+    }
+}
+//----------------------------------------------Ʌ
+
+//----------------------------------------------------V
+public class OtlpMetricExporter : BaseExporter<Metric>
+{
+    private const int GrpcStartWritePosition = 5;
+    private readonly OtlpExporterTransmissionHandler transmissionHandler;
+    private readonly int startWritePosition;
+
+    private Resource? resource;
+
+    // Initial buffer size set to ~732KB.
+    // This choice allows us to gradually grow the buffer while targeting a final capacity of around 100 MB,
+    // by the 7th doubling to maintain efficient allocation without frequent resizing.
+    private byte[] buffer = new byte[750000];
+
+    public OtlpMetricExporter(OtlpExporterOptions options) : this(options, experimentalOptions: new(), transmissionHandler: null) { }
+
+    internal OtlpMetricExporter(OtlpExporterOptions exporterOptions, ExperimentalOptions experimentalOptions, OtlpExporterTransmissionHandler? transmissionHandler = null)
+    {
+        this.startWritePosition = exporterOptions!.Protocol == OtlpExportProtocol.Grpc ? GrpcStartWritePosition : 0;
+        this.transmissionHandler = transmissionHandler ?? exporterOptions!.GetExportTransmissionHandler(experimentalOptions!, OtlpSignalType.Metrics);
+    }
+
+    internal Resource Resource => this.resource ??= this.ParentProvider.GetResource();
+
+    public override ExportResult Export(in Batch<Metric> metrics)
+    {
+        // Prevents the exporter's gRPC and HTTP operations from being instrumented.
+        using var scope = SuppressInstrumentationScope.Begin();
+
+        try
+        {
+            int writePosition = ProtobufOtlpMetricSerializer.WriteMetricsData(ref this.buffer, this.startWritePosition, this.Resource, metrics);
+
+            if (this.startWritePosition == GrpcStartWritePosition)
+            {
+                // Grpc payload consists of 3 parts
+                // byte 0 - Specifying if the payload is compressed.
+                // 1-4 byte - Specifies the length of payload in big endian format.
+                // 5 and above -  Protobuf serialized data.
+                Span<byte> data = new Span<byte>(this.buffer, 1, 4);
+                var dataLength = writePosition - GrpcStartWritePosition;
+                BinaryPrimitives.WriteUInt32BigEndian(data, (uint)dataLength);
+            }
+
+            if (!this.transmissionHandler.TrySubmitRequest(this.buffer, writePosition))
+            {
+                return ExportResult.Failure;
+            }
+        }
+        catch (Exception ex)
+        {
+            OpenTelemetryProtocolExporterEventSource.Log.ExportMethodException(ex);
+            return ExportResult.Failure;
+        }
+
+        return ExportResult.Success;
+    }
+
+    protected override bool OnShutdown(int timeoutMilliseconds) => this.transmissionHandler.Shutdown(timeoutMilliseconds);
+}
+//----------------------------------------------------Ʌ
 
 //---------------------V
 public static class Sdk
@@ -244,9 +722,7 @@ internal sealed class MeterProviderSdk : MeterProvider
     private CompositeMetricReader? compositeMetricReader;
     private MetricReader? reader;
 
-    internal MeterProviderSdk(
-        IServiceProvider serviceProvider,
-        bool ownsServiceProvider)
+    internal MeterProviderSdk(IServiceProvider serviceProvider, bool ownsServiceProvider)
     {
         Debug.Assert(serviceProvider != null, "serviceProvider was null");
 
@@ -368,12 +844,12 @@ internal sealed class MeterProviderSdk : MeterProvider
 
         OpenTelemetrySdkEventSource.Log.MeterProviderSdkEvent($"Number of views configured = {viewConfigCount}.");
 
-        this.listener.InstrumentPublished = (instrument, listener) =>   // <-----------------------mt0.3
+        this.listener.InstrumentPublished = (instrument, listener) =>   // <-----------------------met2.3
         {
-            object? state = this.InstrumentPublished(instrument, listeningIsManagedExternally: false);  // <-------------mt0.4, state is MetricState
+            object? state = this.InstrumentPublished(instrument, listeningIsManagedExternally: false);  // <-------------met2.4.0, state is MetricState
             if (state != null)
             {
-                listener.EnableMeasurementEvents(instrument, state);   // <------------------------
+                listener.EnableMeasurementEvents(instrument, state);   // <------------------------met2.5.0
             }
         };
 
@@ -384,13 +860,13 @@ internal sealed class MeterProviderSdk : MeterProvider
 
         // Everything long
         this.listener.SetMeasurementEventCallback<long>(MeasurementRecordedLong);
-        this.listener.SetMeasurementEventCallback<int>(static (instrument, value, tags, state) => MeasurementRecordedLong(instrument, value, tags, state));  // <-------mt2.1
+        this.listener.SetMeasurementEventCallback<int>(static (instrument, value, tags, state) => MeasurementRecordedLong(instrument, value, tags, state));  // <-------
         this.listener.SetMeasurementEventCallback<short>(static (instrument, value, tags, state) => MeasurementRecordedLong(instrument, value, tags, state));
         this.listener.SetMeasurementEventCallback<byte>(static (instrument, value, tags, state) => MeasurementRecordedLong(instrument, value, tags, state));
 
-        this.listener.MeasurementsCompleted = MeasurementsCompleted;
+        this.listener.MeasurementsCompleted = MeasurementsCompleted;    // <----------------------------------
 
-        this.listener.Start();
+        this.listener.Start();   // <-----------------------------!!
 
         OpenTelemetrySdkEventSource.Log.MeterProviderSdkEvent("MeterProvider built successfully.");
     }
@@ -433,9 +909,9 @@ internal sealed class MeterProviderSdk : MeterProvider
         metricState.RecordMeasurementDouble(value, tags);
     }
 
-    internal object? InstrumentPublished(Instrument instrument, bool listeningIsManagedExternally)   // <-------------------------mt0.5
+    internal object? InstrumentPublished(Instrument instrument, bool listeningIsManagedExternally)   // <-------------------------met2.4.0
     {
-        var listenToInstrumentUsingSdkConfiguration = this.shouldListenTo(instrument);
+        var listenToInstrumentUsingSdkConfiguration = this.shouldListenTo(instrument); // <-------------------met2.4.1
 
         if (listeningIsManagedExternally && listenToInstrumentUsingSdkConfiguration)   // listeningIsManagedExternally is default by false
         {
@@ -463,17 +939,15 @@ internal sealed class MeterProviderSdk : MeterProvider
             {
                 if (!MeterProviderBuilderSdk.IsValidInstrumentName(instrument.Name))
                 {
-                    OpenTelemetrySdkEventSource.Log.MetricInstrumentIgnored(
-                        instrument.Name,
-                        instrument.Meter.Name,
-                        "Instrument name is invalid.",
-                        "The name must comply with the OpenTelemetry specification");
+                    OpenTelemetrySdkEventSource.Log.MetricInstrumentIgnored(instrument.Name, instrument.Meter.Name,
+                        "Instrument name is invalid.", "The name must comply with the OpenTelemetry specification");
+
                     return null;
                 }
 
                 if (this.reader != null)
                 {
-                    var metrics = this.reader.AddMetricWithNoViews(instrument);
+                    List<Metric> metrics = this.reader.AddMetricWithNoViews(instrument);   // <----------------------met2.4.2, reader is PeriodicExportingMetricReader
                     if (metrics.Count == 1)
                     {
                         state = MetricState.BuildForSingleMetric(metrics[0]);
@@ -508,16 +982,12 @@ internal sealed class MeterProviderSdk : MeterProvider
                             metricStreamConfig.ViewId = i;
                         }
 
-                        if (metricStreamConfig is HistogramConfiguration
-                            && instrument.GetType().GetGenericTypeDefinition() != typeof(Histogram<>))
+                        if (metricStreamConfig is HistogramConfiguration && instrument.GetType().GetGenericTypeDefinition() != typeof(Histogram<>))
                         {
                             metricStreamConfig = null;
 
-                            OpenTelemetrySdkEventSource.Log.MetricViewIgnored(
-                                instrument.Name,
-                                instrument.Meter.Name,
-                                "The current SDK does not allow aggregating non-Histogram instruments as Histograms.",
-                                "Fix the view configuration.");
+                            OpenTelemetrySdkEventSource.Log.MetricViewIgnored(instrument.Name, instrument.Meter.Name,
+                                "The current SDK does not allow aggregating non-Histogram instruments as Histograms.", "Fix the view configuration.");
                         }
                     }
                     catch (Exception ex)
@@ -533,10 +1003,7 @@ internal sealed class MeterProviderSdk : MeterProvider
 
                 if (metricStreamConfigs.Count == 0)
                 {
-                    // No views matched. Add null
-                    // which will apply defaults.
-                    // Users can turn off this default
-                    // by adding a view like below as the last view.
+                    // no views matched. Add null which will apply defaults. users can turn off this default by adding a view like below as the last view:
                     // .AddView(instrumentName: "*", MetricStreamConfiguration.Drop)
                     metricStreamConfigs.Add(null);
                 }
@@ -749,9 +1216,7 @@ internal sealed class MeterProviderBuilderSdk : MeterProviderBuilder, IMeterProv
     public static bool IsValidInstrumentName(string instrumentName)
     {
         if (string.IsNullOrWhiteSpace(instrumentName))
-        {
             return false;
-        }
 
         return InstrumentNameRegex.IsMatch(instrumentName);
     }
@@ -815,7 +1280,7 @@ internal sealed class MeterProviderBuilderSdk : MeterProviderBuilder, IMeterProv
         return this;
     }
 
-    public override MeterProviderBuilder AddMeter(params string[] names)  // <-------------------------------1
+    public override MeterProviderBuilder AddMeter(params string[] names)  // <-------------------------------
     {
         foreach (var name in names!)
         {
@@ -832,7 +1297,7 @@ internal sealed class MeterProviderBuilderSdk : MeterProviderBuilder, IMeterProv
         return this;
     }
 
-    public MeterProviderBuilder AddView(Func<Instrument, MetricStreamConfiguration?> viewConfig)
+    public MeterProviderBuilder AddView(Func<Instrument, MetricStreamConfiguration?> viewConfig)   // <--------------------------
     {
         this.ViewConfigs.Add(viewConfig!);
 
@@ -883,6 +1348,13 @@ internal sealed class MeterProviderBuilderSdk : MeterProviderBuilder, IMeterProv
     }
 }
 //-------------------------------------------Ʌ
+
+//---------------------------------------V
+public class MeterProvider : BaseProvider
+{
+    protected MeterProvider() { }
+}
+//---------------------------------------Ʌ
 
 //------------------------------------------------V
 internal sealed class OpenTelemetryMetricsListener : IMetricsListener, IDisposable
@@ -1063,74 +1535,7 @@ public sealed class Metric
             aggType = AggregationType.LongSumIncomingDelta;
             this.MetricType = MetricType.LongSum;
         }
-        else if (instrumentIdentity.InstrumentType == typeof(Counter<double>)
-            || instrumentIdentity.InstrumentType == typeof(Counter<float>))
-        {
-            aggType = AggregationType.DoubleSumIncomingDelta;
-            this.MetricType = MetricType.DoubleSum;
-        }
-        else if (instrumentIdentity.InstrumentType == typeof(ObservableCounter<double>)
-            || instrumentIdentity.InstrumentType == typeof(ObservableCounter<float>))
-        {
-            aggType = AggregationType.DoubleSumIncomingCumulative;
-            this.MetricType = MetricType.DoubleSum;
-        }
-        else if (instrumentIdentity.InstrumentType == typeof(ObservableUpDownCounter<long>)
-            || instrumentIdentity.InstrumentType == typeof(ObservableUpDownCounter<int>)
-            || instrumentIdentity.InstrumentType == typeof(ObservableUpDownCounter<short>)
-            || instrumentIdentity.InstrumentType == typeof(ObservableUpDownCounter<byte>))
-        {
-            aggType = AggregationType.LongSumIncomingCumulative;
-            this.MetricType = MetricType.LongSumNonMonotonic;
-        }
-        else if (instrumentIdentity.InstrumentType == typeof(UpDownCounter<long>)
-            || instrumentIdentity.InstrumentType == typeof(UpDownCounter<int>)
-            || instrumentIdentity.InstrumentType == typeof(UpDownCounter<short>)
-            || instrumentIdentity.InstrumentType == typeof(UpDownCounter<byte>))
-        {
-            aggType = AggregationType.LongSumIncomingDelta;
-            this.MetricType = MetricType.LongSumNonMonotonic;
-        }
-        else if (instrumentIdentity.InstrumentType == typeof(UpDownCounter<double>)
-            || instrumentIdentity.InstrumentType == typeof(UpDownCounter<float>))
-        {
-            aggType = AggregationType.DoubleSumIncomingDelta;
-            this.MetricType = MetricType.DoubleSumNonMonotonic;
-        }
-        else if (instrumentIdentity.InstrumentType == typeof(ObservableUpDownCounter<double>)
-            || instrumentIdentity.InstrumentType == typeof(ObservableUpDownCounter<float>))
-        {
-            aggType = AggregationType.DoubleSumIncomingCumulative;
-            this.MetricType = MetricType.DoubleSumNonMonotonic;
-        }
-        else if (instrumentIdentity.InstrumentType == typeof(ObservableGauge<double>)
-            || instrumentIdentity.InstrumentType == typeof(ObservableGauge<float>))
-        {
-            aggType = AggregationType.DoubleGauge;
-            this.MetricType = MetricType.DoubleGauge;
-        }
-        else if (instrumentIdentity.InstrumentType == typeof(Gauge<double>)
-            || instrumentIdentity.InstrumentType == typeof(Gauge<float>))
-        {
-            aggType = AggregationType.DoubleGauge;
-            this.MetricType = MetricType.DoubleGauge;
-        }
-        else if (instrumentIdentity.InstrumentType == typeof(ObservableGauge<long>)
-            || instrumentIdentity.InstrumentType == typeof(ObservableGauge<int>)
-            || instrumentIdentity.InstrumentType == typeof(ObservableGauge<short>)
-            || instrumentIdentity.InstrumentType == typeof(ObservableGauge<byte>))
-        {
-            aggType = AggregationType.LongGauge;
-            this.MetricType = MetricType.LongGauge;
-        }
-        else if (instrumentIdentity.InstrumentType == typeof(Gauge<long>)
-            || instrumentIdentity.InstrumentType == typeof(Gauge<int>)
-            || instrumentIdentity.InstrumentType == typeof(Gauge<short>)
-            || instrumentIdentity.InstrumentType == typeof(Gauge<byte>))
-        {
-            aggType = AggregationType.LongGauge;
-            this.MetricType = MetricType.LongGauge;
-        }
+        // ...
         else if (instrumentIdentity.IsHistogram)
         {
             var explicitBucketBounds = instrumentIdentity.HistogramBucketBounds;
@@ -1559,11 +1964,8 @@ public struct MetricPoint
 
     public readonly bool TryGetHistogramMinMaxValues(out double min, out double max)
     {
-        if (this.aggType == AggregationType.HistogramWithMinMax
-            || this.aggType == AggregationType.HistogramWithMinMaxBuckets)
+        if (this.aggType == AggregationType.HistogramWithMinMax || this.aggType == AggregationType.HistogramWithMinMaxBuckets)
         {
-            Debug.Assert(this.mpComponents?.HistogramBuckets != null, "HistogramBuckets was null");
-
             min = this.mpComponents!.HistogramBuckets!.SnapshotMin;
             max = this.mpComponents.HistogramBuckets.SnapshotMax;
             return true;
@@ -1571,8 +1973,6 @@ public struct MetricPoint
 
         if (this.aggType == AggregationType.Base2ExponentialHistogramWithMinMax)
         {
-            Debug.Assert(this.mpComponents?.Base2ExponentialBucketHistogram != null, "Base2ExponentialBucketHistogram was null");
-
             min = this.mpComponents!.Base2ExponentialBucketHistogram!.SnapshotMin;
             max = this.mpComponents.Base2ExponentialBucketHistogram.SnapshotMax;
             return true;
@@ -1601,41 +2001,41 @@ public struct MetricPoint
         switch (this.aggType)
         {
             case AggregationType.LongSumIncomingDelta:
-                {
-                    Interlocked.Add(ref this.runningValue.AsLong, number);
-                    break;
-                }
+            {
+                Interlocked.Add(ref this.runningValue.AsLong, number);
+                break;
+            }
 
             case AggregationType.LongSumIncomingCumulative:
             case AggregationType.LongGauge:
-                {
-                    Interlocked.Exchange(ref this.runningValue.AsLong, number);
-                    break;
-                }
+            {
+                Interlocked.Exchange(ref this.runningValue.AsLong, number);
+                break;
+            }
 
             case AggregationType.Histogram:
-                {
-                    this.UpdateHistogram(number);
-                    return;
-                }
+            {
+                this.UpdateHistogram(number);
+                return;
+            }
 
             case AggregationType.HistogramWithMinMax:
-                {
-                    this.UpdateHistogramWithMinMax(number);
-                    return;
-                }
+            {
+                this.UpdateHistogramWithMinMax(number);
+                return;
+            }
 
             case AggregationType.HistogramWithBuckets:
-                {
-                    this.UpdateHistogramWithBuckets(number);
-                    return;
-                }
+            {
+                this.UpdateHistogramWithBuckets(number);
+                return;
+            }
 
             case AggregationType.HistogramWithMinMaxBuckets:
-                {
-                    this.UpdateHistogramWithBucketsAndMinMax(number);
-                    return;
-                }
+            {
+                this.UpdateHistogramWithBucketsAndMinMax(number);
+                return;
+            }
             // ...
         }
 
@@ -1647,41 +2047,41 @@ public struct MetricPoint
         switch (this.aggType)
         {
             case AggregationType.LongSumIncomingDelta:
-                {
-                    Interlocked.Add(ref this.runningValue.AsLong, number);
-                    break;
-                }
+            {
+                Interlocked.Add(ref this.runningValue.AsLong, number);
+                break;
+            }
 
             case AggregationType.LongSumIncomingCumulative:
             case AggregationType.LongGauge:
-                {
-                    Interlocked.Exchange(ref this.runningValue.AsLong, number);
-                    break;
-                }
+            {
+                Interlocked.Exchange(ref this.runningValue.AsLong, number);
+                break;
+            }
 
             case AggregationType.Histogram:
-                {
-                    this.UpdateHistogram(number, tags, offerExemplar);
-                    return;
-                }
+            {
+                this.UpdateHistogram(number, tags, offerExemplar);
+                return;
+            }
 
             case AggregationType.HistogramWithMinMax:
-                {
-                    this.UpdateHistogramWithMinMax(number, tags, offerExemplar);
-                    return;
-                }
+            {
+                this.UpdateHistogramWithMinMax(number, tags, offerExemplar);
+                return;
+            }
 
             case AggregationType.HistogramWithBuckets:
-                {
-                    this.UpdateHistogramWithBuckets(number, tags, offerExemplar);
-                    return;
-                }
+            {
+                this.UpdateHistogramWithBuckets(number, tags, offerExemplar);
+                return;
+            }
 
             case AggregationType.HistogramWithMinMaxBuckets:
-                {
-                    this.UpdateHistogramWithBucketsAndMinMax(number, tags, offerExemplar);
-                    return;
-                }
+            {
+                this.UpdateHistogramWithBucketsAndMinMax(number, tags, offerExemplar);
+                return;
+            }
             // ...
         }
 
@@ -2288,6 +2688,15 @@ public class ExplicitBucketHistogramConfiguration : HistogramConfiguration
     }
 }
 //-----------------------------------------------Ʌ
+
+//----------------------------V
+public enum ExemplarFilterType
+{
+    AlwaysOff,
+    AlwaysOn,
+    TraceBased,
+}
+//----------------------------Ʌ
 ```
 
 ```C#
@@ -2633,8 +3042,7 @@ public class PeriodicExportingMetricReader : BaseExportingMetricReader
         this.ExportIntervalMilliseconds = exportIntervalMilliseconds;
         this.ExportTimeoutMilliseconds = exportTimeoutMilliseconds;
 
-        // use Thread rather than Task.Run (because it uses the thread pool) needs a long-running,
-        // dedicated background thread, that is not tied to the .NET thread pool 
+        // use Thread rather than Task.Run (because it uses the thread pool) needs a long-running, dedicated background thread, that is not tied to the .NET thread pool 
         this.exporterThread = new Thread(new ThreadStart(this.ExporterProc))   // <-----------------------------
         {
             IsBackground = true,
@@ -2676,7 +3084,7 @@ public class PeriodicExportingMetricReader : BaseExportingMetricReader
                     return;
                 case WaitHandle.WaitTimeout: // timer
                     OpenTelemetrySdkEventSource.Log.MetricReaderEvent("PeriodicExportingMetricReader calling MetricReader.Collect because the export interval has elapsed.");
-                    this.Collect(this.ExportTimeoutMilliseconds);
+                    this.Collect(this.ExportTimeoutMilliseconds);   // <------------------------- calls MetricReader.Collect()
                     break;
             }
         }
@@ -2975,7 +3383,7 @@ public abstract partial class MetricReader : IDisposable
             lock (this.onCollectLock)
             {
                 this.collectionTcs = null;
-                result = this.OnCollect(timeoutMilliseconds);
+                result = this.OnCollect(timeoutMilliseconds);   // <-------------------------------------
             }
         }
         catch (Exception ex)
@@ -3004,7 +3412,7 @@ public abstract partial class MetricReader : IDisposable
 
         OpenTelemetrySdkEventSource.Log.MetricReaderEvent("Observable instruments collected.");
 
-        var metrics = this.GetMetricsBatch();
+        var metrics = this.GetMetricsBatch();   // <----------------------------------------------------
 
         bool result;
         if (sw == null)
@@ -3121,9 +3529,9 @@ public abstract partial class MetricReader
         return this.temporalityFunc(instrumentType);
     }
 
-    internal virtual List<Metric> AddMetricWithNoViews(Instrument instrument)
+    internal virtual List<Metric> AddMetricWithNoViews(Instrument instrument)   // <---------------------------met2.4.2
     {
-        var metricStreamIdentity = new MetricStreamIdentity(instrument!, metricStreamConfiguration: null);
+        var metricStreamIdentity = new MetricStreamIdentity(instrument!, metricStreamConfiguration: null);   // <---------------------------met2.4.3
 
         var exemplarFilter = metricStreamIdentity.IsHistogram
             ? this.exemplarFilterForHistograms ?? this.exemplarFilter
@@ -3147,7 +3555,7 @@ public abstract partial class MetricReader
                 Metric? metric = null;
                 try
                 {
-                    metric = new Metric(
+                    metric = new Metric(      // <---------------------------met2.4.4
                         metricStreamIdentity,
                         this.GetAggregationTemporality(metricStreamIdentity.InstrumentType),
                         this.cardinalityLimit,
@@ -3160,11 +3568,11 @@ public abstract partial class MetricReader
                 }
 
                 this.instrumentIdentityToMetric[metricStreamIdentity] = metric;
-                this.metrics![index] = metric;
+                this.metrics![index] = metric;     // <---------------------------met2.4.5
 
                 this.CreateOrUpdateMetricStreamRegistration(in metricStreamIdentity);
 
-                return new() { metric };
+                return new() { metric };   // <---------------------------met2.4.5.
             }
         }
     }
@@ -3257,7 +3665,7 @@ public abstract partial class MetricReader
         }
     }
 
-    private Batch<Metric> GetMetricsBatch()
+    private Batch<Metric> GetMetricsBatch()   // <---------------------------------------
     {      
         try
         {
@@ -3295,4 +3703,942 @@ public abstract partial class MetricReader
     }
 }
 //----------------------------------------Ʌ
+```
+
+=====================================================================================================================
+
+```C#
+//-----------------------------------V
+internal sealed class AggregatorStore
+{
+    internal readonly FrozenSet<string>? TagKeysInteresting;
+    internal readonly bool OutputDelta;
+    internal readonly int NumberOfMetricPoints;
+    internal readonly ConcurrentDictionary<Tags, LookupData>? TagsToMetricPointIndexDictionaryDelta;
+    internal readonly Func<ExemplarReservoir?>? ExemplarReservoirFactory;
+    internal long DroppedMeasurements;
+
+    private const ExemplarFilterType DefaultExemplarFilter = ExemplarFilterType.AlwaysOff;
+    private static readonly Comparison<KeyValuePair<string, object?>> DimensionComparisonDelegate = (x, y) => string.Compare(x.Key, y.Key, StringComparison.Ordinal);
+
+    private readonly Lock lockZeroTags = new();
+    private readonly Lock lockOverflowTag = new();
+    private readonly int tagsKeysInterestingCount;
+
+    // This holds the reclaimed MetricPoints that are available for reuse.
+    private readonly Queue<int>? availableMetricPoints;
+
+    private readonly ConcurrentDictionary<Tags, int> tagsToMetricPointIndexDictionary =
+        new();
+
+    private readonly string name;
+    private readonly MetricPoint[] metricPoints;
+    private readonly int[] currentMetricPointBatch;
+    private readonly AggregationType aggType;
+    private readonly double[] histogramBounds;
+    private readonly int exponentialHistogramMaxSize;
+    private readonly int exponentialHistogramMaxScale;
+    private readonly UpdateLongDelegate updateLongCallback;
+    private readonly UpdateDoubleDelegate updateDoubleCallback;
+    private readonly ExemplarFilterType exemplarFilter;
+    private readonly Func<KeyValuePair<string, object?>[], int, int> lookupAggregatorStore;
+
+    private int metricPointIndex;
+    private int batchSize;
+    private bool zeroTagMetricPointInitialized;
+    private bool overflowTagMetricPointInitialized;
+
+    internal AggregatorStore(
+        MetricStreamIdentity metricStreamIdentity,
+        AggregationType aggType,
+        AggregationTemporality temporality,
+        int cardinalityLimit,
+        ExemplarFilterType? exemplarFilter = null,
+        Func<ExemplarReservoir?>? exemplarReservoirFactory = null)
+    {
+        this.name = metricStreamIdentity.InstrumentName;
+
+        // Increase the CardinalityLimit by 2 to reserve additional space.
+        // This adjustment accounts for overflow attribute and a case where zero tags are provided.
+        // Previously, these were included within the original cardinalityLimit, but now they are explicitly added to enhance clarity.
+        this.NumberOfMetricPoints = cardinalityLimit + 2;
+
+        this.metricPoints = new MetricPoint[this.NumberOfMetricPoints];
+        this.currentMetricPointBatch = new int[this.NumberOfMetricPoints];
+        this.aggType = aggType;
+        this.OutputDelta = temporality == AggregationTemporality.Delta;
+        this.histogramBounds = metricStreamIdentity.HistogramBucketBounds ?? FindDefaultHistogramBounds(in metricStreamIdentity);
+        this.exponentialHistogramMaxSize = metricStreamIdentity.ExponentialHistogramMaxSize;
+        this.exponentialHistogramMaxScale = metricStreamIdentity.ExponentialHistogramMaxScale;
+        this.StartTimeExclusive = DateTimeOffset.UtcNow;
+        this.ExemplarReservoirFactory = exemplarReservoirFactory;
+        if (metricStreamIdentity.TagKeys == null)
+        {
+            this.updateLongCallback = this.UpdateLong;
+            this.updateDoubleCallback = this.UpdateDouble;
+        }
+        else
+        {
+            this.updateLongCallback = this.UpdateLongCustomTags;
+            this.updateDoubleCallback = this.UpdateDoubleCustomTags;
+            var hs = FrozenSet.ToFrozenSet(metricStreamIdentity.TagKeys, StringComparer.Ordinal);
+
+            this.TagKeysInteresting = hs;
+            this.tagsKeysInterestingCount = hs.Count;
+        }
+
+        this.exemplarFilter = exemplarFilter ?? DefaultExemplarFilter;
+
+        // Setting metricPointIndex to 1 as we would reserve the metricPoints[1] for overflow attribute.
+        // Newer attributes should be added starting at the index: 2
+        this.metricPointIndex = 1;
+
+        // Always reclaim unused MetricPoints for Delta aggregation temporality
+        if (this.OutputDelta)
+        {
+            this.availableMetricPoints = new Queue<int>(cardinalityLimit);
+
+            // There is no overload which only takes capacity as the parameter
+            // Using the DefaultConcurrencyLevel defined in the ConcurrentDictionary class: https://github.com/dotnet/runtime/blob/v7.0.5/src/libraries/System.Collections.Concurrent/src/System/Collections/Concurrent/ConcurrentDictionary.cs#L2020
+            // We expect at the most (user provided cardinality limit) * 2 entries- one for sorted and one for unsorted input
+            this.TagsToMetricPointIndexDictionaryDelta =
+                new ConcurrentDictionary<Tags, LookupData>(concurrencyLevel: Environment.ProcessorCount, capacity: cardinalityLimit * 2);
+
+            // Add all the indices except for the reserved ones to the queue so that threads have
+            // readily available access to these MetricPoints for their use.
+            // Index 0 and 1 are reserved for no tags and overflow
+            for (int i = 2; i < this.NumberOfMetricPoints; i++)
+            {
+                this.availableMetricPoints.Enqueue(i);
+            }
+
+            this.lookupAggregatorStore = this.LookupAggregatorStoreForDeltaWithReclaim;
+        }
+        else
+        {
+            this.lookupAggregatorStore = this.LookupAggregatorStore;
+        }
+    }
+
+    private delegate void UpdateLongDelegate(long value, ReadOnlySpan<KeyValuePair<string, object?>> tags);
+
+    private delegate void UpdateDoubleDelegate(double value, ReadOnlySpan<KeyValuePair<string, object?>> tags);
+
+    internal DateTimeOffset StartTimeExclusive { get; private set; }
+
+    internal DateTimeOffset EndTimeInclusive { get; private set; }
+
+    internal double[] HistogramBounds => this.histogramBounds;
+
+    internal bool IsExemplarEnabled()
+    {
+        // Using this filter to indicate On/Off
+        // instead of another separate flag.
+        return this.exemplarFilter != ExemplarFilterType.AlwaysOff;
+    }
+
+    internal void Update(long value, ReadOnlySpan<KeyValuePair<string, object?>> tags)
+    {
+        try
+        {
+            this.updateLongCallback(value, tags);
+        }
+        catch (Exception)
+        {
+            Interlocked.Increment(ref this.DroppedMeasurements);
+            OpenTelemetrySdkEventSource.Log.MeasurementDropped(this.name, "SDK internal error occurred.", "Contact SDK owners.");
+        }
+    }
+
+    internal void Update(double value, ReadOnlySpan<KeyValuePair<string, object?>> tags)
+    {
+        try
+        {
+            this.updateDoubleCallback(value, tags);
+        }
+        catch (Exception)
+        {
+            Interlocked.Increment(ref this.DroppedMeasurements);
+            OpenTelemetrySdkEventSource.Log.MeasurementDropped(this.name, "SDK internal error occurred.", "Contact SDK owners.");
+        }
+    }
+
+    internal int Snapshot()
+    {
+        this.batchSize = 0;
+        if (this.OutputDelta)
+        {
+            this.SnapshotDeltaWithMetricPointReclaim();
+        }
+        else
+        {
+            var indexSnapshot = Math.Min(this.metricPointIndex, this.NumberOfMetricPoints - 1);
+            this.SnapshotCumulative(indexSnapshot);
+        }
+
+        this.EndTimeInclusive = DateTimeOffset.UtcNow;
+        return this.batchSize;
+    }
+
+    internal void SnapshotDeltaWithMetricPointReclaim()
+    {
+        // Index = 0 is reserved for the case where no dimensions are provided.
+        ref var metricPointWithNoTags = ref this.metricPoints[0];
+        if (metricPointWithNoTags.MetricPointStatus != MetricPointStatus.NoCollectPending)
+        {
+            this.TakeMetricPointSnapshot(ref metricPointWithNoTags, outputDelta: true);
+
+            this.currentMetricPointBatch[this.batchSize] = 0;
+            this.batchSize++;
+        }
+
+        // TakeSnapshot for the MetricPoint for overflow
+        ref var metricPointForOverflow = ref this.metricPoints[1];
+        if (metricPointForOverflow.MetricPointStatus != MetricPointStatus.NoCollectPending)
+        {
+            this.TakeMetricPointSnapshot(ref metricPointForOverflow, outputDelta: true);
+
+            this.currentMetricPointBatch[this.batchSize] = 1;
+            this.batchSize++;
+        }
+
+        // Index 0 and 1 are reserved for no tags and overflow
+        for (int i = 2; i < this.NumberOfMetricPoints; i++)
+        {
+            ref var metricPoint = ref this.metricPoints[i];
+
+            if (metricPoint.MetricPointStatus == MetricPointStatus.NoCollectPending)
+            {
+                // Reclaim the MetricPoint if it was marked for it in the previous collect cycle
+                if (metricPoint.LookupData != null && metricPoint.LookupData.DeferredReclaim == true)
+                {
+                    this.ReclaimMetricPoint(ref metricPoint, i);
+                    continue;
+                }
+
+                // Check if the MetricPoint could be reclaimed in the current Collect cycle.
+                // If metricPoint.LookupData is `null` then the MetricPoint is already reclaimed and in the queue.
+                // If the Collect thread is successfully able to compare and swap the reference count from zero to int.MinValue, it means that
+                // the MetricPoint can be reused for other tags.
+                if (metricPoint.LookupData != null && Interlocked.CompareExchange(ref metricPoint.ReferenceCount, int.MinValue, 0) == 0)
+                {
+                    // This is similar to double-checked locking. For some rare case, the Collect thread might read the status as `NoCollectPending`,
+                    // and then get switched out before it could set the ReferenceCount to `int.MinValue`. In the meantime, an Update thread could come in
+                    // and update the MetricPoint, thereby, setting its status to `CollectPending`. Note that the ReferenceCount would be 0 after the update.
+                    // If the Collect thread now wakes up, it would be able to set the ReferenceCount to `int.MinValue`, thereby, marking the MetricPoint
+                    // invalid for newer updates. In such cases, the MetricPoint, should not be reclaimed before taking its Snapshot.
+
+                    if (metricPoint.MetricPointStatus == MetricPointStatus.NoCollectPending)
+                    {
+                        this.ReclaimMetricPoint(ref metricPoint, i);
+                    }
+                    else
+                    {
+                        // MetricPoint's ReferenceCount is `int.MinValue` but it still has a collect pending. Take the MetricPoint's Snapshot
+                        // and mark it to be reclaimed in the next Collect cycle.
+
+                        metricPoint.LookupData.DeferredReclaim = true;
+
+                        this.TakeMetricPointSnapshot(ref metricPoint, outputDelta: true);
+
+                        this.currentMetricPointBatch[this.batchSize] = i;
+                        this.batchSize++;
+                    }
+                }
+
+                continue;
+            }
+
+            this.TakeMetricPointSnapshot(ref metricPoint, outputDelta: true);
+
+            this.currentMetricPointBatch[this.batchSize] = i;
+            this.batchSize++;
+        }
+
+        if (this.EndTimeInclusive != default)
+        {
+            this.StartTimeExclusive = this.EndTimeInclusive;
+        }
+    }
+
+    internal void SnapshotCumulative(int indexSnapshot)
+    {
+        for (int i = 0; i <= indexSnapshot; i++)
+        {
+            ref var metricPoint = ref this.metricPoints[i];
+            if (!metricPoint.IsInitialized)
+            {
+                continue;
+            }
+
+            this.TakeMetricPointSnapshot(ref metricPoint, outputDelta: false);
+
+            this.currentMetricPointBatch[this.batchSize] = i;
+            this.batchSize++;
+        }
+    }
+
+    internal MetricPointsAccessor GetMetricPoints()
+        => new(this.metricPoints, this.currentMetricPointBatch, this.batchSize);
+
+    private static double[] FindDefaultHistogramBounds(in MetricStreamIdentity metricStreamIdentity)
+    {
+        if (metricStreamIdentity.Unit == "s")
+        {
+            if (Metric.DefaultHistogramBoundShortMappings.Contains((metricStreamIdentity.MeterName, metricStreamIdentity.InstrumentName)))
+            {
+                return Metric.DefaultHistogramBoundsShortSeconds;
+            }
+
+            if (Metric.DefaultHistogramBoundLongMappings.Contains((metricStreamIdentity.MeterName, metricStreamIdentity.InstrumentName)))
+            {
+                return Metric.DefaultHistogramBoundsLongSeconds;
+            }
+        }
+
+        return Metric.DefaultHistogramBounds;
+    }
+
+    private void TakeMetricPointSnapshot(ref MetricPoint metricPoint, bool outputDelta)
+    {
+        if (this.IsExemplarEnabled())
+        {
+            metricPoint.TakeSnapshotWithExemplar(outputDelta);
+        }
+        else
+        {
+            metricPoint.TakeSnapshot(outputDelta);
+        }
+    }
+
+    private void ReclaimMetricPoint(ref MetricPoint metricPoint, int metricPointIndex)
+    {
+        /*
+         This method does three things:
+          1. Set `metricPoint.LookupData` and `metricPoint.mpComponents` to `null` to have them collected faster by GC.
+          2. Tries to remove the entry for this MetricPoint from the lookup dictionary. An update thread which retrieves this
+             MetricPoint would realize that the MetricPoint is not valid for use since its reference count would have been set to a negative number.
+             When that happens, the update thread would also try to remove the entry for this MetricPoint from the lookup dictionary.
+             We only care about the entry getting removed from the lookup dictionary and not about which thread removes it.
+          3. Put the array index of this MetricPoint to the queue of available metric points. This makes it available for update threads
+             to use this MetricPoint to track newer dimension combinations.
+        */
+
+        var lookupData = metricPoint.LookupData;
+
+        metricPoint.NullifyMetricPointState();
+
+        lock (this.TagsToMetricPointIndexDictionaryDelta!)
+        {
+            LookupData? dictionaryValue;
+            if (lookupData!.SortedTags != Tags.EmptyTags)
+            {
+                // Check if no other thread added a new entry for the same Tags.
+                // If no, then remove the existing entries.
+                if (this.TagsToMetricPointIndexDictionaryDelta.TryGetValue(lookupData.SortedTags, out dictionaryValue) &&
+                    dictionaryValue == lookupData)
+                {
+                    this.TagsToMetricPointIndexDictionaryDelta.TryRemove(lookupData.SortedTags, out var _);
+                    this.TagsToMetricPointIndexDictionaryDelta.TryRemove(lookupData.GivenTags, out var _);
+                }
+            }
+            else
+            {
+                if (this.TagsToMetricPointIndexDictionaryDelta.TryGetValue(lookupData.GivenTags, out dictionaryValue) &&
+                    dictionaryValue == lookupData)
+                {
+                    this.TagsToMetricPointIndexDictionaryDelta.TryRemove(lookupData.GivenTags, out var _);
+                }
+            }
+
+            Debug.Assert(this.availableMetricPoints != null, "this.availableMetricPoints was null");
+
+            this.availableMetricPoints!.Enqueue(metricPointIndex);
+        }
+    }
+
+    private void InitializeZeroTagPointIfNotInitialized()
+    {
+        if (!this.zeroTagMetricPointInitialized)
+        {
+            lock (this.lockZeroTags)
+            {
+                if (!this.zeroTagMetricPointInitialized)
+                {
+                    if (this.OutputDelta)
+                    {
+                        var lookupData = new LookupData(0, Tags.EmptyTags, Tags.EmptyTags);
+                        this.metricPoints[0] = new MetricPoint(this, this.aggType, null, this.histogramBounds, this.exponentialHistogramMaxSize, this.exponentialHistogramMaxScale, lookupData);
+                    }
+                    else
+                    {
+                        this.metricPoints[0] = new MetricPoint(this, this.aggType, null, this.histogramBounds, this.exponentialHistogramMaxSize, this.exponentialHistogramMaxScale);
+                    }
+
+                    this.zeroTagMetricPointInitialized = true;
+                }
+            }
+        }
+    }
+
+    private void InitializeOverflowTagPointIfNotInitialized()
+    {
+        if (!this.overflowTagMetricPointInitialized)
+        {
+            lock (this.lockOverflowTag)
+            {
+                if (!this.overflowTagMetricPointInitialized)
+                {
+                    var keyValuePairs = new KeyValuePair<string, object?>[] { new("otel.metric.overflow", true) };
+                    var tags = new Tags(keyValuePairs);
+
+                    if (this.OutputDelta)
+                    {
+                        var lookupData = new LookupData(1, tags, tags);
+                        this.metricPoints[1] = new MetricPoint(this, this.aggType, keyValuePairs, this.histogramBounds, this.exponentialHistogramMaxSize, this.exponentialHistogramMaxScale, lookupData);
+                    }
+                    else
+                    {
+                        this.metricPoints[1] = new MetricPoint(this, this.aggType, keyValuePairs, this.histogramBounds, this.exponentialHistogramMaxSize, this.exponentialHistogramMaxScale);
+                    }
+
+                    this.overflowTagMetricPointInitialized = true;
+                }
+            }
+        }
+    }
+
+    private int LookupAggregatorStore(KeyValuePair<string, object?>[] tagKeysAndValues, int length)
+    {
+        var givenTags = new Tags(tagKeysAndValues);
+
+        if (!this.tagsToMetricPointIndexDictionary.TryGetValue(givenTags, out var aggregatorIndex))
+        {
+            if (length > 1)
+            {
+                // Note: We are using storage from ThreadStatic, so need to make a deep copy for Dictionary storage.
+                // Create or obtain new arrays to temporarily hold the sorted tag Keys and Values
+                var storage = ThreadStaticStorage.GetStorage();
+                storage.CloneKeysAndValues(tagKeysAndValues, length, out var tempSortedTagKeysAndValues);
+
+                Array.Sort(tempSortedTagKeysAndValues, DimensionComparisonDelegate);
+
+                var sortedTags = new Tags(tempSortedTagKeysAndValues);
+
+                if (!this.tagsToMetricPointIndexDictionary.TryGetValue(sortedTags, out aggregatorIndex))
+                {
+                    aggregatorIndex = this.metricPointIndex;
+                    if (aggregatorIndex >= this.NumberOfMetricPoints)
+                    {
+                        // sorry! out of data points.
+                        // TODO: Once we support cleanup of
+                        // unused points (typically with delta)
+                        // we can re-claim them here.
+                        return -1;
+                    }
+
+                    // Note: We are using storage from ThreadStatic (for upto MaxTagCacheSize tags) for both the input order of tags and the sorted order of tags,
+                    // so we need to make a deep copy for Dictionary storage.
+                    if (length <= ThreadStaticStorage.MaxTagCacheSize)
+                    {
+                        var givenTagKeysAndValues = new KeyValuePair<string, object?>[length];
+                        tagKeysAndValues.CopyTo(givenTagKeysAndValues.AsSpan());
+
+                        var sortedTagKeysAndValues = new KeyValuePair<string, object?>[length];
+                        tempSortedTagKeysAndValues.CopyTo(sortedTagKeysAndValues.AsSpan());
+
+                        givenTags = new Tags(givenTagKeysAndValues);
+                        sortedTags = new Tags(sortedTagKeysAndValues);
+                    }
+
+                    lock (this.tagsToMetricPointIndexDictionary)
+                    {
+                        // check again after acquiring lock.
+                        if (!this.tagsToMetricPointIndexDictionary.TryGetValue(sortedTags, out aggregatorIndex))
+                        {
+                            aggregatorIndex = ++this.metricPointIndex;
+                            if (aggregatorIndex >= this.NumberOfMetricPoints)
+                            {
+                                // sorry! out of data points.
+                                // TODO: Once we support cleanup of
+                                // unused points (typically with delta)
+                                // we can re-claim them here.
+                                return -1;
+                            }
+
+                            ref var metricPoint = ref this.metricPoints[aggregatorIndex];
+                            metricPoint = new MetricPoint(this, this.aggType, sortedTags.KeyValuePairs, this.histogramBounds, this.exponentialHistogramMaxSize, this.exponentialHistogramMaxScale);
+
+                            // Add to dictionary *after* initializing MetricPoint
+                            // as other threads can start writing to the
+                            // MetricPoint, if dictionary entry found.
+
+                            // Add the sorted order along with the given order of tags
+                            this.tagsToMetricPointIndexDictionary.TryAdd(sortedTags, aggregatorIndex);
+                            this.tagsToMetricPointIndexDictionary.TryAdd(givenTags, aggregatorIndex);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // This else block is for tag length = 1
+                aggregatorIndex = this.metricPointIndex;
+                if (aggregatorIndex >= this.NumberOfMetricPoints)
+                {
+                    return -1;
+                }
+
+                // Note: We are using storage from ThreadStatic, so need to make a deep copy for Dictionary storage.
+                var givenTagKeysAndValues = new KeyValuePair<string, object?>[length];
+
+                tagKeysAndValues.CopyTo(givenTagKeysAndValues.AsSpan());
+
+                givenTags = new Tags(givenTagKeysAndValues);
+
+                lock (this.tagsToMetricPointIndexDictionary)
+                {
+                    // check again after acquiring lock.
+                    if (!this.tagsToMetricPointIndexDictionary.TryGetValue(givenTags, out aggregatorIndex))
+                    {
+                        aggregatorIndex = ++this.metricPointIndex;
+                        if (aggregatorIndex >= this.NumberOfMetricPoints)
+                        {
+                            // sorry! out of data points.
+                            // TODO: Once we support cleanup of
+                            // unused points (typically with delta)
+                            // we can re-claim them here.
+                            return -1;
+                        }
+
+                        ref var metricPoint = ref this.metricPoints[aggregatorIndex];
+                        metricPoint = new MetricPoint(this, this.aggType, givenTags.KeyValuePairs, this.histogramBounds, this.exponentialHistogramMaxSize, this.exponentialHistogramMaxScale);
+
+                        // Add to dictionary *after* initializing MetricPoint
+                        // as other threads can start writing to the
+                        // MetricPoint, if dictionary entry found.
+
+                        // givenTags will always be sorted when tags length == 1
+                        this.tagsToMetricPointIndexDictionary.TryAdd(givenTags, aggregatorIndex);
+                    }
+                }
+            }
+        }
+
+        return aggregatorIndex;
+    }
+
+    private int LookupAggregatorStoreForDeltaWithReclaim(KeyValuePair<string, object?>[] tagKeysAndValues, int length)
+    {
+        int index;
+        var givenTags = new Tags(tagKeysAndValues);
+
+        bool newMetricPointCreated = false;
+
+        if (!this.TagsToMetricPointIndexDictionaryDelta!.TryGetValue(givenTags, out var lookupData))
+        {
+            if (length > 1)
+            {
+                // Note: We are using storage from ThreadStatic, so need to make a deep copy for Dictionary storage.
+                // Create or obtain new arrays to temporarily hold the sorted tag Keys and Values
+                var storage = ThreadStaticStorage.GetStorage();
+                storage.CloneKeysAndValues(tagKeysAndValues, length, out var tempSortedTagKeysAndValues);
+
+                Array.Sort(tempSortedTagKeysAndValues, DimensionComparisonDelegate);
+
+                var sortedTags = new Tags(tempSortedTagKeysAndValues);
+
+                if (!this.TagsToMetricPointIndexDictionaryDelta.TryGetValue(sortedTags, out lookupData))
+                {
+                    // Note: We are using storage from ThreadStatic (for up to MaxTagCacheSize tags) for both the input order of tags and the sorted order of tags,
+                    // so we need to make a deep copy for Dictionary storage.
+                    if (length <= ThreadStaticStorage.MaxTagCacheSize)
+                    {
+                        var givenTagKeysAndValues = new KeyValuePair<string, object?>[length];
+                        tagKeysAndValues.CopyTo(givenTagKeysAndValues.AsSpan());
+
+                        var sortedTagKeysAndValues = new KeyValuePair<string, object?>[length];
+                        tempSortedTagKeysAndValues.CopyTo(sortedTagKeysAndValues.AsSpan());
+
+                        givenTags = new Tags(givenTagKeysAndValues);
+                        sortedTags = new Tags(sortedTagKeysAndValues);
+                    }
+
+                    lock (this.TagsToMetricPointIndexDictionaryDelta)
+                    {
+                        // check again after acquiring lock.
+                        if (!this.TagsToMetricPointIndexDictionaryDelta.TryGetValue(sortedTags, out lookupData))
+                        {
+                            // Check for an available MetricPoint
+                            if (this.availableMetricPoints!.Count > 0)
+                            {
+                                index = this.availableMetricPoints.Dequeue();
+                            }
+                            else
+                            {
+                                // No MetricPoint is available for reuse
+                                return -1;
+                            }
+
+                            lookupData = new LookupData(index, sortedTags, givenTags);
+
+                            ref var metricPoint = ref this.metricPoints[index];
+                            metricPoint = new MetricPoint(this, this.aggType, sortedTags.KeyValuePairs, this.histogramBounds, this.exponentialHistogramMaxSize, this.exponentialHistogramMaxScale, lookupData);
+                            newMetricPointCreated = true;
+
+                            // Add to dictionary *after* initializing MetricPoint
+                            // as other threads can start writing to the
+                            // MetricPoint, if dictionary entry found.
+
+                            // Add the sorted order along with the given order of tags
+                            this.TagsToMetricPointIndexDictionaryDelta.TryAdd(sortedTags, lookupData);
+                            this.TagsToMetricPointIndexDictionaryDelta.TryAdd(givenTags, lookupData);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // This else block is for tag length = 1
+
+                // Note: We are using storage from ThreadStatic, so need to make a deep copy for Dictionary storage.
+                var givenTagKeysAndValues = new KeyValuePair<string, object?>[length];
+
+                tagKeysAndValues.CopyTo(givenTagKeysAndValues.AsSpan());
+
+                givenTags = new Tags(givenTagKeysAndValues);
+
+                Debug.Assert(this.availableMetricPoints != null, "this.availableMetricPoints was null");
+
+                lock (this.TagsToMetricPointIndexDictionaryDelta)
+                {
+                    // check again after acquiring lock.
+                    if (!this.TagsToMetricPointIndexDictionaryDelta.TryGetValue(givenTags, out lookupData))
+                    {
+                        // Check for an available MetricPoint
+                        if (this.availableMetricPoints!.Count > 0)
+                        {
+                            index = this.availableMetricPoints.Dequeue();
+                        }
+                        else
+                        {
+                            // No MetricPoint is available for reuse
+                            return -1;
+                        }
+
+                        lookupData = new LookupData(index, Tags.EmptyTags, givenTags);
+
+                        ref var metricPoint = ref this.metricPoints[index];
+                        metricPoint = new MetricPoint(this, this.aggType, givenTags.KeyValuePairs, this.histogramBounds, this.exponentialHistogramMaxSize, this.exponentialHistogramMaxScale, lookupData);
+                        newMetricPointCreated = true;
+
+                        // Add to dictionary *after* initializing MetricPoint
+                        // as other threads can start writing to the
+                        // MetricPoint, if dictionary entry found.
+
+                        // givenTags will always be sorted when tags length == 1
+                        this.TagsToMetricPointIndexDictionaryDelta.TryAdd(givenTags, lookupData);
+                    }
+                }
+            }
+        }
+
+        // Found the MetricPoint
+        index = lookupData.Index;
+
+        // If the running thread created a new MetricPoint, then the Snapshot method cannot reclaim that MetricPoint because MetricPoint is initialized with a ReferenceCount of 1.
+        // It can simply return the index.
+
+        if (!newMetricPointCreated)
+        {
+            // If the running thread did not create the MetricPoint, it could be working on an index that has been reclaimed by Snapshot method.
+            // This could happen if the thread get switched out by CPU after it retrieves the index but the Snapshot method reclaims it before the thread wakes up again.
+
+            ref var metricPointAtIndex = ref this.metricPoints[index];
+            var referenceCount = Interlocked.Increment(ref metricPointAtIndex.ReferenceCount);
+
+            if (referenceCount < 0)
+            {
+                index = this.RemoveStaleEntriesAndGetAvailableMetricPointRare(lookupData, length);
+            }
+            else if (metricPointAtIndex.LookupData != lookupData)
+            {
+                Interlocked.Decrement(ref metricPointAtIndex.ReferenceCount);
+
+                // Retry attempt to get a MetricPoint.
+                index = this.RemoveStaleEntriesAndGetAvailableMetricPointRare(lookupData, length);
+            }
+        }
+
+        return index;
+    }
+
+    // this method is always called under `lock(this.tagsToMetricPointIndexDictionaryDelta)` so it's safe with other code that adds or removes
+    // entries from `this.tagsToMetricPointIndexDictionaryDelta`
+    private bool TryGetAvailableMetricPointRare(Tags givenTags, Tags sortedTags, int length, [NotNullWhen(true)] out LookupData? lookupData, out bool newMetricPointCreated)
+    {
+        int index;
+        newMetricPointCreated = false;
+
+        if (length > 1)
+        {
+            // check again after acquiring lock.
+            if (!this.TagsToMetricPointIndexDictionaryDelta!.TryGetValue(givenTags, out lookupData) &&
+                !this.TagsToMetricPointIndexDictionaryDelta.TryGetValue(sortedTags, out lookupData))
+            {
+                // Check for an available MetricPoint
+                if (this.availableMetricPoints!.Count > 0)
+                {
+                    index = this.availableMetricPoints.Dequeue();
+                }
+                else
+                {
+                    // No MetricPoint is available for reuse
+                    return false;
+                }
+
+                lookupData = new LookupData(index, sortedTags, givenTags);
+
+                ref var metricPoint = ref this.metricPoints[index];
+                metricPoint = new MetricPoint(this, this.aggType, sortedTags.KeyValuePairs, this.histogramBounds, this.exponentialHistogramMaxSize, this.exponentialHistogramMaxScale, lookupData);
+                newMetricPointCreated = true;
+
+                // Add to dictionary *after* initializing MetricPoint
+                // as other threads can start writing to the
+                // MetricPoint, if dictionary entry found.
+
+                // Add the sorted order along with the given order of tags
+                this.TagsToMetricPointIndexDictionaryDelta.TryAdd(sortedTags, lookupData);
+                this.TagsToMetricPointIndexDictionaryDelta.TryAdd(givenTags, lookupData);
+            }
+        }
+        else
+        {
+            // check again after acquiring lock.
+            if (!this.TagsToMetricPointIndexDictionaryDelta!.TryGetValue(givenTags, out lookupData))
+            {
+                // Check for an available MetricPoint
+                if (this.availableMetricPoints!.Count > 0)
+                {
+                    index = this.availableMetricPoints.Dequeue();
+                }
+                else
+                {
+                    // No MetricPoint is available for reuse
+                    return false;
+                }
+
+                lookupData = new LookupData(index, Tags.EmptyTags, givenTags);
+
+                ref var metricPoint = ref this.metricPoints[index];
+                metricPoint = new MetricPoint(this, this.aggType, givenTags.KeyValuePairs, this.histogramBounds, this.exponentialHistogramMaxSize, this.exponentialHistogramMaxScale, lookupData);
+                newMetricPointCreated = true;
+
+                // Add to dictionary *after* initializing MetricPoint
+                // as other threads can start writing to the
+                // MetricPoint, if dictionary entry found.
+
+                // givenTags will always be sorted when tags length == 1
+                this.TagsToMetricPointIndexDictionaryDelta.TryAdd(givenTags, lookupData);
+            }
+        }
+
+        return true;
+    }
+
+    // This method is essentially a retry attempt for when `LookupAggregatorStoreForDeltaWithReclaim` cannot find a MetricPoint.
+    // If we still fail to get a MetricPoint in this method, we don't retry any further and simply drop the measurement.
+    // This method acquires `lock (this.tagsToMetricPointIndexDictionaryDelta)`
+    private int RemoveStaleEntriesAndGetAvailableMetricPointRare(LookupData lookupData, int length)
+    {
+        bool foundMetricPoint = false;
+        bool newMetricPointCreated = false;
+        var sortedTags = lookupData.SortedTags;
+        var inputTags = lookupData.GivenTags;
+
+        // Acquire lock
+        // Try to remove stale entries from dictionary
+        // Get the index for a new MetricPoint (it could be self-claimed or from another thread that added a fresh entry)
+        // If self-claimed, then add a fresh entry to the dictionary
+        // If an available MetricPoint is found, then only increment the ReferenceCount
+
+        // Delete the entry for these Tags and get another MetricPoint.
+        lock (this.TagsToMetricPointIndexDictionaryDelta!)
+        {
+            LookupData? dictionaryValue;
+            if (lookupData.SortedTags != Tags.EmptyTags)
+            {
+                // Check if no other thread added a new entry for the same Tags in the meantime.
+                // If no, then remove the existing entries.
+                if (this.TagsToMetricPointIndexDictionaryDelta.TryGetValue(lookupData.SortedTags, out dictionaryValue))
+                {
+                    if (dictionaryValue == lookupData)
+                    {
+                        // No other thread added a new entry for the same Tags.
+                        this.TagsToMetricPointIndexDictionaryDelta.TryRemove(lookupData.SortedTags, out _);
+                        this.TagsToMetricPointIndexDictionaryDelta.TryRemove(lookupData.GivenTags, out _);
+                    }
+                    else
+                    {
+                        // Some other thread added a new entry for these Tags. Use the new MetricPoint
+                        lookupData = dictionaryValue;
+                        foundMetricPoint = true;
+                    }
+                }
+            }
+            else
+            {
+                if (this.TagsToMetricPointIndexDictionaryDelta.TryGetValue(lookupData.GivenTags, out dictionaryValue))
+                {
+                    if (dictionaryValue == lookupData)
+                    {
+                        // No other thread added a new entry for the same Tags.
+                        this.TagsToMetricPointIndexDictionaryDelta.TryRemove(lookupData.GivenTags, out _);
+                    }
+                    else
+                    {
+                        // Some other thread added a new entry for these Tags. Use the new MetricPoint
+                        lookupData = dictionaryValue;
+                        foundMetricPoint = true;
+                    }
+                }
+            }
+
+            if (!foundMetricPoint
+                && this.TryGetAvailableMetricPointRare(inputTags, sortedTags, length, out var tempLookupData, out newMetricPointCreated))
+            {
+                foundMetricPoint = true;
+                lookupData = tempLookupData;
+            }
+        }
+
+        if (foundMetricPoint)
+        {
+            var index = lookupData.Index;
+
+            // If the running thread created a new MetricPoint, then the Snapshot method cannot reclaim that MetricPoint because MetricPoint is initialized with a ReferenceCount of 1.
+            // It can simply return the index.
+
+            if (!newMetricPointCreated)
+            {
+                // If the running thread did not create the MetricPoint, it could be working on an index that has been reclaimed by Snapshot method.
+                // This could happen if the thread get switched out by CPU after it retrieves the index but the Snapshot method reclaims it before the thread wakes up again.
+
+                ref var metricPointAtIndex = ref this.metricPoints[index];
+                var referenceCount = Interlocked.Increment(ref metricPointAtIndex.ReferenceCount);
+
+                if (referenceCount < 0)
+                {
+                    // Super rare case: Snapshot method had already marked the MetricPoint available for reuse as it has not been updated in last collect cycle even in the retry attempt.
+                    // Example scenario mentioned in `LookupAggregatorStoreForDeltaWithReclaim` method.
+
+                    // Don't retry again and drop the measurement.
+                    return -1;
+                }
+                else if (metricPointAtIndex.LookupData != lookupData)
+                {
+                    // Rare case: Another thread with different input tags could have reclaimed this MetricPoint if it was freed up by Snapshot method even in the retry attempt.
+                    // Example scenario mentioned in `LookupAggregatorStoreForDeltaWithReclaim` method.
+
+                    // Remove reference since its not the right MetricPoint.
+                    Interlocked.Decrement(ref metricPointAtIndex.ReferenceCount);
+
+                    // Don't retry again and drop the measurement.
+                    return -1;
+                }
+            }
+
+            return index;
+        }
+        else
+        {
+            // No MetricPoint is available for reuse
+            return -1;
+        }
+    }
+
+    private void UpdateLong(long value, ReadOnlySpan<KeyValuePair<string, object?>> tags)
+    {
+        var index = this.FindMetricAggregatorsDefault(tags);
+
+        this.UpdateLongMetricPoint(index, value, tags);
+    }
+
+    private void UpdateLongCustomTags(long value, ReadOnlySpan<KeyValuePair<string, object?>> tags)
+    {
+        var index = this.FindMetricAggregatorsCustomTag(tags);
+
+        this.UpdateLongMetricPoint(index, value, tags);
+    }
+
+    private void UpdateLongMetricPoint(int metricPointIndex, long value, ReadOnlySpan<KeyValuePair<string, object?>> tags)
+    {
+        if (metricPointIndex < 0)
+        {
+            Interlocked.Increment(ref this.DroppedMeasurements);
+            this.InitializeOverflowTagPointIfNotInitialized();
+            this.metricPoints[1].Update(value);
+
+            return;
+        }
+
+        var exemplarFilterType = this.exemplarFilter;
+        if (exemplarFilterType == ExemplarFilterType.AlwaysOff)
+        {
+            this.metricPoints[metricPointIndex].Update(value);
+        }
+        else if (exemplarFilterType == ExemplarFilterType.AlwaysOn)
+        {
+            this.metricPoints[metricPointIndex].UpdateWithExemplar(value, tags, offerExemplar: true);
+        }
+        else
+        {
+            this.metricPoints[metricPointIndex].UpdateWithExemplar(value, tags, offerExemplar: Activity.Current?.Recorded ?? false);
+        }
+    }
+
+    // ...
+
+    private int FindMetricAggregatorsDefault(ReadOnlySpan<KeyValuePair<string, object?>> tags)
+    {
+        int tagLength = tags.Length;
+        if (tagLength == 0)
+        {
+            this.InitializeZeroTagPointIfNotInitialized();
+            return 0;
+        }
+
+        var storage = ThreadStaticStorage.GetStorage();
+
+        storage.SplitToKeysAndValues(tags, tagLength, out var tagKeysAndValues);
+
+        return this.lookupAggregatorStore(tagKeysAndValues, tagLength);
+    }
+
+    private int FindMetricAggregatorsCustomTag(ReadOnlySpan<KeyValuePair<string, object?>> tags)
+    {
+        int tagLength = tags.Length;
+        if (tagLength == 0 || this.tagsKeysInterestingCount == 0)
+        {
+            this.InitializeZeroTagPointIfNotInitialized();
+            return 0;
+        }
+
+        var storage = ThreadStaticStorage.GetStorage();
+
+        Debug.Assert(this.TagKeysInteresting != null, "this.tagKeysInteresting was null");
+
+        storage.SplitToKeysAndValues(tags, tagLength, this.TagKeysInteresting!, out var tagKeysAndValues, out var actualLength);
+
+        // actual number of tags depend on how many  of the incoming tags has user opted to select.
+        if (actualLength == 0)
+        {
+            this.InitializeZeroTagPointIfNotInitialized();
+            return 0;
+        }
+
+        return this.lookupAggregatorStore(tagKeysAndValues!, actualLength);
+    }
+}
+//-----------------------------------Ʌ
 ```

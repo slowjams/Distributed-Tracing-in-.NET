@@ -6,8 +6,7 @@ using System.Threading.Tasks;
 
 namespace BookStore.Infrastructure.Repositories
 {
-    public class CategoryRepository(BookStoreDbContext context,
-        BookStoreMetrics meters) : Repository<Category>(context), ICategoryRepository
+    public class CategoryRepository(BookStoreDbContext context, BookStoreMetrics meters) : Repository<Category>(context), ICategoryRepository
     {
         public override async Task Add(Category entity)
         {
