@@ -1767,7 +1767,6 @@ public abstract class Instrument
         }
     }
 
-   
     internal object? EnableMeasurement(ListenerSubscription subscription, out bool oldStateStored)  
     {
         oldStateStored = false;
@@ -1938,9 +1937,9 @@ public sealed class MeterListener : IDisposable
     public Action<Instrument, MeterListener>? InstrumentPublished { get; set; }
 
     public Action<Instrument, object?>? MeasurementsCompleted { get; set; }
-
+                                                                                                                               
     public void EnableMeasurementEvents(Instrument instrument, object? state = null)   // <----------------------------met2.5.0
-    {
+    {                                                               // state is MetricState
         if (!Meter.IsSupported)
         {
             return;
@@ -1955,7 +1954,7 @@ public sealed class MeterListener : IDisposable
             if (instrument is not null && !_disposed && !instrument.Meter.Disposed)
             {
                 _enabledMeasurementInstruments.AddIfNotExist(instrument, object.ReferenceEquals);
-                oldState = instrument.EnableMeasurement(new ListenerSubscription(this, state), out oldStateStored);
+                oldState = instrument.EnableMeasurement(new ListenerSubscription(this, state), out oldStateStored);  // <-------------------------met2.5.1
                 enabled = true;
             }
         }
@@ -2127,11 +2126,7 @@ public sealed class MeterListener : IDisposable
     // GetAllListeners is called from Instrument.Publish inside Instrument.SyncObject lock.
     internal static List<MeterListener>? GetAllListeners() => s_allStartedListeners.Count == 0 ? null : new List<MeterListener>(s_allStartedListeners);
 
-    internal void NotifyMeasurement<T>(   // <-------------------------met3.3
-        Instrument instrument, 
-        T measurement, 
-        ReadOnlySpan<KeyValuePair<string, object?>> tags, 
-        object? state) where T : struct
+    internal void NotifyMeasurement<T>(Instrument instrument, T measurement, ReadOnlySpan<KeyValuePair<string, object?>> tags, object? state)  // <----------------------met3.3
     {
         if (typeof(T) == typeof(byte))
             _byteMeasurementCallback(instrument, (byte)(object)measurement, tags, state);
@@ -2257,7 +2252,7 @@ public interface IMeterFactory : IDisposable
 //-------------------------------------V
 internal sealed class DummyMeterFactory : IMeterFactory
 {
-    public Meter Create(MeterOptions options) => new Meter(options);  // <--------------------------met0
+    public Meter Create(MeterOptions options) => new Meter(options);  // <--------------------------met0.
  
     public void Dispose() { }
 }

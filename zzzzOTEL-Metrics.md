@@ -724,8 +724,6 @@ internal sealed class MeterProviderSdk : MeterProvider
 
     internal MeterProviderSdk(IServiceProvider serviceProvider, bool ownsServiceProvider)
     {
-        Debug.Assert(serviceProvider != null, "serviceProvider was null");
-
         MeterProviderBuilderSdk state = serviceProvider!.GetRequiredService<MeterProviderBuilderSdk>();
         state.RegisterProvider(this);
 
@@ -846,7 +844,7 @@ internal sealed class MeterProviderSdk : MeterProvider
 
         this.listener.InstrumentPublished = (instrument, listener) =>   // <-----------------------met2.3
         {
-            object? state = this.InstrumentPublished(instrument, listeningIsManagedExternally: false);  // <-------------met2.4.0, state is MetricState
+            MetricState? state = this.InstrumentPublished(instrument, listeningIsManagedExternally: false);  // <-------------met2.4.0
             if (state != null)
             {
                 listener.EnableMeasurementEvents(instrument, state);   // <------------------------met2.5.0
@@ -860,7 +858,7 @@ internal sealed class MeterProviderSdk : MeterProvider
 
         // Everything long
         this.listener.SetMeasurementEventCallback<long>(MeasurementRecordedLong);
-        this.listener.SetMeasurementEventCallback<int>(static (instrument, value, tags, state) => MeasurementRecordedLong(instrument, value, tags, state));  // <-------
+        this.listener.SetMeasurementEventCallback<int>(static (instrument, value, tags, state) => MeasurementRecordedLong(instrument, value, tags, state));  // <-------met3.4
         this.listener.SetMeasurementEventCallback<short>(static (instrument, value, tags, state) => MeasurementRecordedLong(instrument, value, tags, state));
         this.listener.SetMeasurementEventCallback<byte>(static (instrument, value, tags, state) => MeasurementRecordedLong(instrument, value, tags, state));
 
@@ -879,38 +877,9 @@ internal sealed class MeterProviderSdk : MeterProvider
 
     internal int ViewCount => this.viewConfigs.Count;
 
-    internal static void MeasurementsCompleted(Instrument instrument, object? state)
-    {
-        if (state is not MetricState metricState)
-            return;
-
-        metricState.CompleteMeasurement();
-    }
-
-    internal static void MeasurementRecordedLong(Instrument instrument, long value, ReadOnlySpan<KeyValuePair<string, object?>> tags, object? state)  // <-------mt2.2
-    {
-        if (state is not MetricState metricState)
-        {
-            OpenTelemetrySdkEventSource.Log.MeasurementDropped(instrument?.Name ?? "UnknownInstrument", "SDK internal error occurred.", "Contact SDK owners.");
-            return;
-        }
-
-        metricState.RecordMeasurementLong(value, tags);
-    }
-
-    internal static void MeasurementRecordedDouble(Instrument instrument, double value, ReadOnlySpan<KeyValuePair<string, object?>> tags, object? state)
-    {
-        if (state is not MetricState metricState)
-        {
-            OpenTelemetrySdkEventSource.Log.MeasurementDropped(instrument?.Name ?? "UnknownInstrument", "SDK internal error occurred.", "Contact SDK owners.");
-            return;
-        }
-
-        metricState.RecordMeasurementDouble(value, tags);
-    }
-
+    // object is MetricState
     internal object? InstrumentPublished(Instrument instrument, bool listeningIsManagedExternally)   // <-------------------------met2.4.0
-    {
+    {   
         var listenToInstrumentUsingSdkConfiguration = this.shouldListenTo(instrument); // <-------------------met2.4.1
 
         if (listeningIsManagedExternally && listenToInstrumentUsingSdkConfiguration)   // listeningIsManagedExternally is default by false
@@ -1038,6 +1007,36 @@ internal sealed class MeterProviderSdk : MeterProvider
             OpenTelemetrySdkEventSource.Log.MetricInstrumentIgnored(instrument.Name, instrument.Meter.Name, "SDK internal error occurred.", "Contact SDK owners.");
             return null;
         }
+    }
+
+    internal static void MeasurementsCompleted(Instrument instrument, object? state)
+    {
+        if (state is not MetricState metricState)
+            return;
+
+        metricState.CompleteMeasurement();
+    }
+
+    internal static void MeasurementRecordedLong(Instrument instrument, long value, ReadOnlySpan<KeyValuePair<string, object?>> tags, object? state)  // <-------met3.4
+    {
+        if (state is not MetricState metricState)
+        {
+            OpenTelemetrySdkEventSource.Log.MeasurementDropped(instrument?.Name ?? "UnknownInstrument", "SDK internal error occurred.", "Contact SDK owners.");
+            return;
+        }
+
+        metricState.RecordMeasurementLong(value, tags);
+    }
+
+    internal static void MeasurementRecordedDouble(Instrument instrument, double value, ReadOnlySpan<KeyValuePair<string, object?>> tags, object? state)
+    {
+        if (state is not MetricState metricState)
+        {
+            OpenTelemetrySdkEventSource.Log.MeasurementDropped(instrument?.Name ?? "UnknownInstrument", "SDK internal error occurred.", "Contact SDK owners.");
+            return;
+        }
+
+        metricState.RecordMeasurementDouble(value, tags);
     }
 
     internal void CollectObservableInstruments()
@@ -1439,7 +1438,7 @@ internal sealed class MetricState
     {
         return new(
             completeMeasurement: () => MetricReader.DeactivateMetric(metric!),
-            recordMeasurementLong: metric!.UpdateLong,
+            recordMeasurementLong: metric!.UpdateLong,      // <-----------------------------------
             recordMeasurementDouble: metric!.UpdateDouble);
     }
 
@@ -1477,12 +1476,10 @@ internal sealed class MetricState
 public sealed class Metric
 {
     internal const int DefaultExponentialHistogramMaxBuckets = 160;
-
     internal const int DefaultExponentialHistogramMaxScale = 20;
-
     internal static readonly double[] DefaultHistogramBounds = new double[] { 0, 5, 10, 25, 50, 75, 100, 250, 500, 750, 1000, 2500, 5000, 7500, 10000 };
 
-    // Short default histogram bounds. Based on the recommended semantic convention values for http.server.request.duration.
+    // short default histogram bounds. Based on the recommended semantic convention values for http.server.request.duration.
     internal static readonly double[] DefaultHistogramBoundsShortSeconds = new double[] { 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10 };
     internal static readonly HashSet<(string, string)> DefaultHistogramBoundShortMappings = new HashSet<(string, string)>
     {
@@ -1594,7 +1591,7 @@ public sealed class Metric
 
     public MetricPointsAccessor GetMetricPoints()  => this.AggregatorStore.GetMetricPoints();
 
-    internal void UpdateLong(long value, ReadOnlySpan<KeyValuePair<string, object?>> tags) => this.AggregatorStore.Update(value, tags);
+    internal void UpdateLong(long value, ReadOnlySpan<KeyValuePair<string, object?>> tags) => this.AggregatorStore.Update(value, tags);  // <--------------------------
 
     internal void UpdateDouble(double value, ReadOnlySpan<KeyValuePair<string, object?>> tags) => this.AggregatorStore.Update(value, tags);
 
@@ -1792,7 +1789,7 @@ internal enum MetricPointStatus
 //-----------------------------Ʌ
 
 //-----------------------V
-public struct MetricPoint
+public struct MetricPoint  // hold the actual value via MetricPointValueStorage
 {
     internal int ReferenceCount;
 
@@ -1804,10 +1801,10 @@ public struct MetricPoint
 
     private MetricPointOptionalComponents? mpComponents;
 
-    // Represents temporality adjusted "value" for double/long metric types or "count" when histogram
-    private MetricPointValueStorage runningValue;
+    // represents temporality adjusted "value" for double/long metric types or "count" when histogram
+    private MetricPointValueStorage runningValue;  // <------------------------------------
 
-    // Represents either "value" for double/long metric types or "count" when histogram
+    // represents either "value" for double/long metric types or "count" when histogram
     private MetricPointValueStorage snapshotValue;
 
     private MetricPointValueStorage deltaLastValue;
@@ -2559,6 +2556,45 @@ public struct MetricPoint
     }
 }
 //-----------------------Ʌ
+
+//-----------------------------------------V
+public readonly struct MetricPointsAccessor
+{
+    private readonly MetricPoint[] metricsPoints;
+    private readonly int[] metricPointsToProcess;
+    private readonly int targetCount;
+
+    internal MetricPointsAccessor(MetricPoint[] metricsPoints, int[] metricPointsToProcess, int targetCount)
+    {
+        this.metricsPoints = metricsPoints!;
+        this.metricPointsToProcess = metricPointsToProcess!;
+        this.targetCount = targetCount;
+    }
+
+    public Enumerator GetEnumerator() => new(this.metricsPoints, this.metricPointsToProcess, this.targetCount);
+
+
+    public struct Enumerator
+    {
+        private readonly MetricPoint[] metricsPoints;
+        private readonly int[] metricPointsToProcess;
+        private readonly int targetCount;
+        private int index;
+
+        internal Enumerator(MetricPoint[] metricsPoints, int[] metricPointsToProcess, int targetCount)
+        {
+            this.metricsPoints = metricsPoints;
+            this.metricPointsToProcess = metricPointsToProcess;
+            this.targetCount = targetCount;
+            this.index = -1;
+        }
+
+        public readonly ref readonly MetricPoint Current  => ref this.metricsPoints[this.metricPointsToProcess[this.index]];
+ 
+        public bool MoveNext() => ++this.index < this.targetCount;
+    }
+}
+//-----------------------------------------Ʌ
 
 //--------------------V
 [Flags]
@@ -3708,6 +3744,21 @@ public abstract partial class MetricReader
 =====================================================================================================================
 
 ```C#
+//-------------------------------------V
+[StructLayout(LayoutKind.Explicit)]
+internal struct MetricPointValueStorage
+{
+    [FieldOffset(0)]
+    public long AsLong;   // <------------------
+
+    [FieldOffset(0)]
+    public double AsDouble;
+}
+//-------------------------------------Ʌ
+```
+
+
+```C#
 //-----------------------------------V
 internal sealed class AggregatorStore
 {
@@ -3728,8 +3779,7 @@ internal sealed class AggregatorStore
     // This holds the reclaimed MetricPoints that are available for reuse.
     private readonly Queue<int>? availableMetricPoints;
 
-    private readonly ConcurrentDictionary<Tags, int> tagsToMetricPointIndexDictionary =
-        new();
+    private readonly ConcurrentDictionary<Tags, int> tagsToMetricPointIndexDictionary = new();
 
     private readonly string name;
     private readonly MetricPoint[] metricPoints;

@@ -2,7 +2,7 @@
 using OpenTelemetry;
 using OpenTelemetry.Metrics;
 
-class Program
+class Program3
 {
     // Create a Meter for your app
     private static readonly Meter MyMeter = new("MyCompany.MyApp", "1.0.0");
@@ -13,7 +13,7 @@ class Program
         unit: "ms",
         description: "Measures HTTP request duration in milliseconds");
 
-    static void Main(string[] args)
+    static void Main3(string[] args)
     {
         using var meterProvider = Sdk.CreateMeterProviderBuilder()
             .AddMeter("MyCompany.MyApp") 

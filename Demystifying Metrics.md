@@ -1,5 +1,114 @@
 ## Demystifying Metrics
 
+Summary Table
+Step	Object	                     What happens
+1	    `Counter<int>`	           Instrument is created
+2	    `Metric`, `MetricState`	   Metric(s) and MetricState are created and linked to the instrument
+3	    `Counter<int>.Add`	       Measurement is recorded
+4	    MetricState	               Routes the measurement to the correct Metric
+5	    Metric	                   Forwards the measurement to AggregatorStore
+6	    AggregatorStore	           Finds or creates a MetricPoint for the tag set
+7	    MetricPoint	               Updates the aggregated value (e.g., increments the sum)
+
+
+## Prerequsite
+
+**How `MeterListener` interacts with `Instrument` on `ListenerSubscription`**
+
+Suppose you want to log measurements to a file, and you need to rotate the log file at runtime (e.g., daily or when a file size limit is reached).
+You can use the state object to hold the current file stream. When you rotate the log, you re-enable the listener with a new file stream as the state, 
+and clean up the old one:
+
+```C#
+class Program
+{
+    static Meter meter = new Meter("Example");
+    static Counter<int> counter = meter.CreateCounter<int>("my_counter");
+
+    static void Main()
+    {
+        const long maxLogSize = 1024; // 1 KB for demonstration
+        string log1Path = "log1.txt";
+        string log2Path = "log2.txt";
+        StreamWriter currentLog = new StreamWriter(log1Path);
+        string currentLogPath = log1Path;
+
+        var listener = new MeterListener();
+        listener.SetMeasurementEventCallback<int>((instrument, value, tags, state) =>
+        {
+            var writer = state as StreamWriter;
+            writer?.WriteLine($"Measurement: {value}");
+            writer?.Flush();
+        });
+
+        listener.MeasurementsCompleted = (instrument, oldState) =>
+        {
+            var oldWriter = oldState as StreamWriter;
+            if (oldWriter != null)
+            {
+                oldWriter.WriteLine("Closing log file.");
+                oldWriter.Dispose();
+            }
+        };
+
+        // initial subscription with log1.txt
+        listener.EnableMeasurementEvents(counter, currentLog);
+
+        // simulate measurements and log rotation
+        for (int i = 0; i < 1000; i++)
+        {
+            counter.Add(i);
+
+            currentLog.Flush();
+            FileInfo fi = new FileInfo(currentLogPath);
+            if (fi.Length >= maxLogSize && currentLogPath == log1Path)  // Check if current log file is full
+            {
+                // Switch to log2.txt
+                StreamWriter newLog = new StreamWriter(log2Path);
+                string oldLogPath = currentLogPath;
+                currentLogPath = log2Path;
+                listener.EnableMeasurementEvents(counter, newLog); // <--------------------this will trigger MeasurementsCompleted for log1
+                currentLog = newLog;
+                Console.WriteLine($"Switched to new log file: {log2Path}");
+            }
+
+            Thread.Sleep(10); // Simulate time between measurements
+        }
+
+        Console.ReadLine();
+    }
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+A second MetricPoint will be created when you record a measurement with a new, previously unseen combination of tag values for that metric stream.
+
+Example
+Suppose your first call is:
+
+If your next call uses a different tag value:
+
+Or if you add another tag key:
+
+Summary
+A new MetricPoint is created for each unique tag value combination.
+If you keep using the same tag set, the same MetricPoint is reused.
+As soon as you use a new combination, a new MetricPoint is created and stored in the array.
+
+
+
 The lock (this.onCollectLock) in MetricReader.Collect is used to ensure thread safety when performing the collection of metrics. Multiple threads might call Collect() at the same time (for example, if triggered by both a periodic exporter and a manual flush). The lock ensures that only one thread can execute the critical section (the actual collection logic) at a time.
 
 ```C#
