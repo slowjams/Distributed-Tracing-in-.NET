@@ -675,7 +675,7 @@ public class BaseExportingMetricReader : MetricReader
         this.exporter.ParentProvider = parentProvider;
     }
 
-    internal override bool ProcessMetrics(in Batch<Metric> metrics, int timeoutMilliseconds)
+    internal override bool ProcessMetrics(in Batch<Metric> metrics, int timeoutMilliseconds)  // <-----------------
     {
         try
         {

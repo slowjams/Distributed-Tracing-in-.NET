@@ -1871,6 +1871,7 @@ public sealed class Counter<T> : Instrument<T> where T : struct
 }
 //----------------------------Ʌ
 
+//------------------------------V
 public sealed class Histogram<T> : Instrument<T> where T : struct
 {
     internal Histogram(Meter meter, string name, string? unit, string? description) : this(meter, name, unit, description, tags: null, advice: null) { }
@@ -1895,7 +1896,7 @@ public sealed class Histogram<T> : Instrument<T> where T : struct
 
     public void Record(T value, in TagList tagList) => RecordMeasurement(value, in tagList);
 }
-
+//------------------------------Ʌ
 
 //----------------------------------------V
 public static class MeterFactoryExtensions

@@ -1025,7 +1025,7 @@ internal sealed class MeterProviderSdk : MeterProvider
             return;
         }
 
-        metricState.RecordMeasurementLong(value, tags);
+        metricState.RecordMeasurementLong(value, tags);  // <----------------------------met3.5
     }
 
     internal static void MeasurementRecordedDouble(Instrument instrument, double value, ReadOnlySpan<KeyValuePair<string, object?>> tags, object? state)
@@ -1438,7 +1438,7 @@ internal sealed class MetricState
     {
         return new(
             completeMeasurement: () => MetricReader.DeactivateMetric(metric!),
-            recordMeasurementLong: metric!.UpdateLong,      // <-----------------------------------
+            recordMeasurementLong: metric!.UpdateLong,      // <----------------------------met3.5
             recordMeasurementDouble: metric!.UpdateDouble);
     }
 
@@ -1591,7 +1591,7 @@ public sealed class Metric
 
     public MetricPointsAccessor GetMetricPoints()  => this.AggregatorStore.GetMetricPoints();
 
-    internal void UpdateLong(long value, ReadOnlySpan<KeyValuePair<string, object?>> tags) => this.AggregatorStore.Update(value, tags);  // <--------------------------
+    internal void UpdateLong(long value, ReadOnlySpan<KeyValuePair<string, object?>> tags) => this.AggregatorStore.Update(value, tags); // <---------------------met3.5.
 
     internal void UpdateDouble(double value, ReadOnlySpan<KeyValuePair<string, object?>> tags) => this.AggregatorStore.Update(value, tags);
 
@@ -3228,12 +3228,14 @@ public class BaseExportingMetricReader : MetricReader
         this.exporter.ParentProvider = parentProvider;
     }
 
-    internal override bool ProcessMetrics(in Batch<Metric> metrics, int timeoutMilliseconds)
+    internal override bool ProcessMetrics(in Batch<Metric> metrics, int timeoutMilliseconds)   // <--------------------------------------
     {
         try
         {
             OpenTelemetrySdkEventSource.Log.MetricReaderEvent(this.exportCalledMessage);
-            var result = this.exporter.Export(metrics);
+
+            var result = this.exporter.Export(metrics);    // <----------------------------------!!
+
             if (result == ExportResult.Success)
             {
                 OpenTelemetrySdkEventSource.Log.MetricReaderEvent(this.exportSucceededMessage);
@@ -3713,7 +3715,7 @@ public abstract partial class MetricReader
                 ref var metric = ref this.metrics![i];
                 if (metric != null)
                 {
-                    int metricPointSize = metric.Snapshot();
+                    int metricPointSize = metric.Snapshot();  // <-------! exporter takes a snapshot to capture the current values of all metrics at that exact moment in time
 
                     if (metricPointSize > 0)
                         this.metricsCurrentBatch![metricCountCurrentBatch++] = metric;
@@ -3813,7 +3815,7 @@ internal sealed class AggregatorStore
         // Previously, these were included within the original cardinalityLimit, but now they are explicitly added to enhance clarity.
         this.NumberOfMetricPoints = cardinalityLimit + 2;
 
-        this.metricPoints = new MetricPoint[this.NumberOfMetricPoints];
+        this.metricPoints = new MetricPoint[this.NumberOfMetricPoints];   // <-------------------------------
         this.currentMetricPointBatch = new int[this.NumberOfMetricPoints];
         this.aggType = aggType;
         this.OutputDelta = temporality == AggregationTemporality.Delta;
@@ -3824,12 +3826,12 @@ internal sealed class AggregatorStore
         this.ExemplarReservoirFactory = exemplarReservoirFactory;
         if (metricStreamIdentity.TagKeys == null)
         {
-            this.updateLongCallback = this.UpdateLong;
+            this.updateLongCallback = this.UpdateLong;   // <----------------------------met4.1 (reference)
             this.updateDoubleCallback = this.UpdateDouble;
         }
         else
         {
-            this.updateLongCallback = this.UpdateLongCustomTags;
+            this.updateLongCallback = this.UpdateLongCustomTags;  // <----------------------------met4.1 (reference)
             this.updateDoubleCallback = this.UpdateDoubleCustomTags;
             var hs = FrozenSet.ToFrozenSet(metricStreamIdentity.TagKeys, StringComparer.Ordinal);
 
@@ -3887,11 +3889,11 @@ internal sealed class AggregatorStore
         return this.exemplarFilter != ExemplarFilterType.AlwaysOff;
     }
 
-    internal void Update(long value, ReadOnlySpan<KeyValuePair<string, object?>> tags)
+    internal void Update(long value, ReadOnlySpan<KeyValuePair<string, object?>> tags)  // <----------------------------met4.0
     {
         try
-        {
-            this.updateLongCallback(value, tags);
+        { 
+            this.updateLongCallback(value, tags);  // <----------------------------met4.1
         }
         catch (Exception)
         {
@@ -4107,7 +4109,7 @@ internal sealed class AggregatorStore
         }
     }
 
-    private void InitializeZeroTagPointIfNotInitialized()
+    private void InitializeZeroTagPointIfNotInitialized()  // <----------------------------met4.3
     {
         if (!this.zeroTagMetricPointInitialized)
         {
@@ -4129,6 +4131,20 @@ internal sealed class AggregatorStore
                 }
             }
         }
+
+        /*
+
+        internal sealed class LookupData
+        {
+            public bool DeferredReclaim;
+            public int Index;
+            public Tags SortedTags;
+            public Tags GivenTags;
+
+            public LookupData(int index, in Tags sortedTags, in Tags givenTags) { ... }
+        }
+        
+        */
     }
 
     private void InitializeOverflowTagPointIfNotInitialized()
@@ -4357,8 +4373,6 @@ internal sealed class AggregatorStore
                 tagKeysAndValues.CopyTo(givenTagKeysAndValues.AsSpan());
 
                 givenTags = new Tags(givenTagKeysAndValues);
-
-                Debug.Assert(this.availableMetricPoints != null, "this.availableMetricPoints was null");
 
                 lock (this.TagsToMetricPointIndexDictionaryDelta)
                 {
@@ -4607,9 +4621,9 @@ internal sealed class AggregatorStore
         }
     }
 
-    private void UpdateLong(long value, ReadOnlySpan<KeyValuePair<string, object?>> tags)
+    private void UpdateLong(long value, ReadOnlySpan<KeyValuePair<string, object?>> tags)   // <----------------------------met4.1
     {
-        var index = this.FindMetricAggregatorsDefault(tags);
+        var index = this.FindMetricAggregatorsDefault(tags);     // <----------------------------met4.2
 
         this.UpdateLongMetricPoint(index, value, tags);
     }
@@ -4649,12 +4663,12 @@ internal sealed class AggregatorStore
 
     // ...
 
-    private int FindMetricAggregatorsDefault(ReadOnlySpan<KeyValuePair<string, object?>> tags)
+    private int FindMetricAggregatorsDefault(ReadOnlySpan<KeyValuePair<string, object?>> tags)  // <----------------------------met4.2
     {
         int tagLength = tags.Length;
         if (tagLength == 0)
         {
-            this.InitializeZeroTagPointIfNotInitialized();
+            this.InitializeZeroTagPointIfNotInitialized();  // <----------------------------met4.3
             return 0;
         }
 

@@ -61,7 +61,7 @@ class Program
 
             currentLog.Flush();
             FileInfo fi = new FileInfo(currentLogPath);
-            if (fi.Length >= maxLogSize && currentLogPath == log1Path)  // Check if current log file is full
+            if (fi.Length >= maxLogSize && currentLogPath == log1Path)  // check if current log file is full
             {
                 // Switch to log2.txt
                 StreamWriter newLog = new StreamWriter(log2Path);
@@ -185,3 +185,22 @@ Great question! The distinction between `Instrument<T>`/`Instrument` and `Metric
 `Instrument<T>` is for recording measurements in your app;  
 `Metric` is for holding the aggregated, export-ready data that the SDK sends to metric backends.  
 Both are needed for a clean, efficient, and flexible metrics pipeline.
+
+
+
+## AggregatorStore 
+
+```C#
+var meter = new Meter("MyApp");
+var counter = meter.CreateCounter<int>("requests");
+
+counter.Add(1, KeyValuePair.Create("region", "us-east"));
+counter.Add(1, KeyValuePair.Create("region", "eu-west"));
+counter.Add(1, KeyValuePair.Create("region", "us-east"));
+```
+
+```yml
+AggregatorStore
+  ├─ MetricPoint[0]: region=us-east, value=2
+  └─ MetricPoint[1]: region=eu-west, value=1
+  ```
